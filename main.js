@@ -1,0 +1,2299 @@
+(function () {
+	const api = window.SubwayBuilderAPI;
+	const React = api.utils.React;
+	const h = React.createElement;
+
+	// ---------------------------------------------------------------------------
+	// Config / constants
+	// ---------------------------------------------------------------------------
+
+	// Confirmed from the game internals: catchment is a walk-time budget in seconds.
+	//   catchmentSeconds = catchmentOverride ?? (BASE_CATCHMENT_SECONDS * catchmentMultiplier)
+	//   radiusMeters     = catchmentSeconds * WALKING_SPEED * walkSpeedMultiplier
+	// BASE = MAX_WALK_TO_FROM_STATION = 60 * 30 = 1800s (30 min). For "standard": 1800 m.
+	const BASE_CATCHMENT_SECONDS = 1800;
+	const CIRCLE_SIDES = 64;
+	const EARTH_R = 6378137; // meters
+
+	let WALK_SPEED = 1; // overwritten from game constants on map ready
+
+	// Catchment fill (matches the established green convention, theme-aware)
+	const FILL_DARK = "#86e08c22";
+	const OUTLINE_DARK = "rgb(75, 119, 74)";
+	const FILL_LIGHT = "#154d4322";
+	const OUTLINE_LIGHT = "rgb(4, 15, 13)";
+	// Gap (uncovered demand, OUTSIDE any catchment) markers
+	const GAP_COLOR = "#ff5a3c";
+	// Conversion (drivers INSIDE a catchment – addressable, not yet won) markers
+	const CONV_COLOR = "#ffc83d";
+
+	const SRC_CATCH = "cpro-catchments";
+	const LYR_CATCH = "cpro-catchment-fill";
+	const SRC_GAP = "cpro-gaps";
+	const LYR_GAP = "cpro-gap-points";
+	const SRC_CONV = "cpro-conversion";
+	const LYR_CONV = "cpro-conversion-points";
+	const SRC_STN = "cpro-stations";
+	const LYR_STN = "cpro-station-markers";
+	const LYR_STN_LABEL = "cpro-station-labels";
+	// Satellite imagery overlay (real photographic tiles via the local proxy). The game hard-
+	// blocks all external tile domains (only subwaybuilder.com / protomaps / localhost / 127.0.0.1
+	// load – proven: even a plain <img> to an external host fails), so tiles MUST come through the
+	// localhost proxy (proxy.js on SAT_PROXY_PORT). All 4 providers are key-free. Below city layers.
+	const SRC_SAT = "cpro-satellite";
+	const LYR_SAT = "cpro-satellite-layer";
+	const SAT_PROXY_PORT = 8080;
+	let satProvider = "esri"; // tile provider; all 4 are key-free
+	function satTileUrl() {
+		return "http://127.0.0.1:" + SAT_PROXY_PORT + "/tile/" + satProvider + "/{z}/{x}/{y}";
+	}
+	const SAT_PROVIDERS = [
+		{ id: "esri", label: "Esri" },
+		{ id: "google", label: "Google" },
+		{ id: "googleHybrid", label: "Hybrid" },
+		{ id: "osm", label: "OSM" },
+	];
+	let satLayerDef = null; // kept by reference; mutate paint/layout in place for style reloads
+	// Keep the overlay layers' defs and mutate layout.visibility,
+	// so the engine recreates them with the CURRENT toggle state on style reload / load
+	// (otherwise they come back visible regardless of the toggles).
+	let catchDef = null,
+		gapDef = null,
+		convDef = null,
+		stnDef = null,
+		stnLabelDef = null;
+
+	// ---------------------------------------------------------------------------
+	// Geometry
+	// ---------------------------------------------------------------------------
+
+	const bearingCache = new Map();
+	function getBearings(sides) {
+		if (bearingCache.has(sides)) return bearingCache.get(sides);
+		const arr = new Array(sides);
+		const step = (2 * Math.PI) / sides;
+		for (let i = 0; i < sides; i++) {
+			const b = i * step;
+			arr[i] = { sinB: Math.sin(b), cosB: Math.cos(b) };
+		}
+		bearingCache.set(sides, arr);
+		return arr;
+	}
+
+	// True geodesic circle, computed per-station (no offset-translation approximation).
+	function geodesicCircle(lon, lat, radiusMeters, sides) {
+		const coords = new Array(sides + 1);
+		const degToRad = Math.PI / 180;
+		const radToDeg = 180 / Math.PI;
+		const lat0 = lat * degToRad;
+		const lon0 = lon * degToRad;
+		const sinLat0 = Math.sin(lat0);
+		const cosLat0 = Math.cos(lat0);
+		const ad = radiusMeters / EARTH_R;
+		const sinAD = Math.sin(ad);
+		const cosAD = Math.cos(ad);
+		const bearings = getBearings(sides);
+		for (let i = 0; i < sides; i++) {
+			const { sinB, cosB } = bearings[i];
+			const latR = Math.asin(sinLat0 * cosAD + cosLat0 * sinAD * cosB);
+			const lonR =
+				lon0 +
+				Math.atan2(sinB * sinAD * cosLat0, cosAD - sinLat0 * Math.sin(latR));
+			coords[i] = [lonR * radToDeg, latR * radToDeg];
+		}
+		coords[sides] = coords[0];
+		return coords;
+	}
+
+	function haversineMeters(lon1, lat1, lon2, lat2) {
+		const toRad = Math.PI / 180;
+		const dLat = (lat2 - lat1) * toRad;
+		const dLon = (lon2 - lon1) * toRad;
+		const a =
+			Math.sin(dLat / 2) ** 2 +
+			Math.cos(lat1 * toRad) * Math.cos(lat2 * toRad) * Math.sin(dLon / 2) ** 2;
+		return 2 * EARTH_R * Math.asin(Math.sqrt(a));
+	}
+
+	// ---------------------------------------------------------------------------
+	// Catchment model
+	// ---------------------------------------------------------------------------
+
+	function catchmentRadiusMeters(station) {
+		const st = api.stations.getStationType(station.stationType) || {};
+		const catchMult = st.catchmentMultiplier != null ? st.catchmentMultiplier : 1;
+		const walkMult = st.walkSpeedMultiplier != null ? st.walkSpeedMultiplier : 1;
+		const seconds =
+			st.catchmentOverride != null
+				? st.catchmentOverride
+				: BASE_CATCHMENT_SECONDS * catchMult;
+		return seconds * WALK_SPEED * walkMult;
+	}
+
+	// ---------------------------------------------------------------------------
+	// Compute (cached; runs on events, never per-frame)
+	// ---------------------------------------------------------------------------
+
+	let catchmentFC = { type: "FeatureCollection", features: [] };
+	let gapFC = { type: "FeatureCollection", features: [] };
+	let conversionFC = { type: "FeatureCollection", features: [] };
+	let stationFC = { type: "FeatureCollection", features: [] };
+	let stats = null;
+
+	function emptyStats() {
+		return {
+			stationCount: 0,
+			cityResidents: 0,
+			cityJobs: 0,
+			coveredResidents: 0,
+			coveredJobs: 0,
+			overlapResidents: 0,
+			overlapJobs: 0,
+			gapCount: 0,
+			gapResidents: 0,
+			gapJobs: 0,
+			// conversion: mode split of people whose home/work is within reach of a station
+			coveredDrivers: 0, // drive despite having a station nearby = the opportunity
+			coveredTransit: 0, // already won
+			coveredWalking: 0,
+			// Level 2 – journey-level (pop pairs: home + work both within a catchment)
+			convertibleDrivers: 0, // drive today, but BOTH ends are walkable to a station
+			homeOnlyDrivers: 0, // only home end served
+			workOnlyDrivers: 0, // only work end served
+			bothEndsTransit: 0, // already on transit with both ends served
+			bothEndsDriving: 0, // same as convertibleDrivers (denominator helper)
+			topBuildTargets: [], // ranked build-here opportunities for the panel
+			perStation: [],
+			perRoute: [],
+			demandAvailable: false,
+		};
+	}
+
+	function driversAt(p) {
+		const r = p.residentModeShare || {};
+		const w = p.workerModeShare || {};
+		return (r.driving || 0) + (w.driving || 0);
+	}
+	function transitAt(p) {
+		const r = p.residentModeShare || {};
+		const w = p.workerModeShare || {};
+		return (r.transit || 0) + (w.transit || 0);
+	}
+	function walkingAt(p) {
+		const r = p.residentModeShare || {};
+		const w = p.workerModeShare || {};
+		return (r.walking || 0) + (w.walking || 0);
+	}
+
+	// Resilience state: guard against the game firing a recompute while its station list is
+	// transiently incomplete (a built station momentarily absent / coords-less), which would
+	// wrongly drop that station's catchment until the next clean recompute.
+	let lastGoodStationCount = 0;
+	let deletionSignaled = false; // set by onStationDeleted so a real shrink is allowed
+	let transientSkips = 0;
+
+	function compute() {
+		// Constructed stations only – blueprints are planned, not built, so they must NOT
+		// count toward coverage/conversion or draw catchment circles (that also kills the
+		// stale-circle-after-blueprint-delete glitch).
+		const stations = (api.gameState.getStations() || []).filter(
+			(s) => s && s.coords && s.buildType !== "blueprint"
+		);
+
+		// If the constructed count shrank without a deletion event, treat it as a transient
+		// bad read and keep the last good result – but accept it if it persists (a real
+		// removal whose event we missed), so we never get stuck.
+		if (lastGoodStationCount > 0 && !deletionSignaled && stations.length < lastGoodStationCount && transientSkips < 3) {
+			transientSkips++;
+			return;
+		}
+		transientSkips = 0;
+		deletionSignaled = false;
+		lastGoodStationCount = stations.length;
+
+		// Build accurate catchment circles + per-station radius
+		const radii = new Array(stations.length);
+		const features = [];
+		for (let i = 0; i < stations.length; i++) {
+			const stn = stations[i];
+			const c = stn.coords;
+			if (!c) continue;
+			const r = catchmentRadiusMeters(stn);
+			radii[i] = r;
+			features.push({
+				type: "Feature",
+				properties: { stationId: stn.id },
+				geometry: {
+					type: "Polygon",
+					coordinates: [geodesicCircle(c[0], c[1], r, CIRCLE_SIDES)],
+				},
+			});
+		}
+		catchmentFC = { type: "FeatureCollection", features };
+
+		const s = emptyStats();
+		s.stationCount = stations.length;
+
+		const demand = api.gameState.getDemandData();
+		const per = stations.map((stn) => ({
+			id: stn.id,
+			name: stn.name,
+			coords: stn.coords,
+			residents: 0,
+			jobs: 0,
+			drivers: 0,
+			transit: 0,
+		}));
+
+		// Per-route accumulators (union over the route's stations – no double count).
+		const routes = api.gameState.getRoutes() || [];
+		const routeAgg = new Map(); // routeId -> {residents, jobs, drivers, transit}
+		for (const rt of routes) routeAgg.set(rt.id, { residents: 0, jobs: 0, drivers: 0, transit: 0 });
+
+		if (demand && demand.points && demand.points.size) {
+			s.demandAvailable = true;
+			const degLat = 1 / 111320; // meters -> degrees latitude
+
+			const coveredPointIds = new Set(); // for Level 2 journey lookup
+			for (const p of demand.points.values()) {
+				const loc = p.location;
+				if (!loc) continue;
+				const res = p.residents || 0;
+				const jobs = p.jobs || 0;
+				const drv = driversAt(p);
+				const trn = transitAt(p);
+				const wlk = walkingAt(p);
+				s.cityResidents += res;
+				s.cityJobs += jobs;
+
+				// Which stations cover this point?
+				let coverCount = 0;
+				const routesHere = new Set();
+				const cosLat = Math.cos(loc[1] * (Math.PI / 180)) || 1e-6;
+				for (let i = 0; i < stations.length; i++) {
+					const r = radii[i];
+					if (!r) continue;
+					const sc = stations[i].coords;
+					// cheap bbox reject before haversine
+					const rDegLat = r * degLat;
+					if (Math.abs(loc[1] - sc[1]) > rDegLat) continue;
+					if (Math.abs(loc[0] - sc[0]) > rDegLat / cosLat) continue;
+					if (haversineMeters(loc[0], loc[1], sc[0], sc[1]) <= r) {
+						coverCount++;
+						per[i].residents += res;
+						per[i].jobs += jobs;
+						per[i].drivers += drv;
+						per[i].transit += trn;
+						const rids = stations[i].routeIds || [];
+						for (const rid of rids) routesHere.add(rid);
+					}
+				}
+
+				// attribute to each route once (union across that route's stations)
+				for (const rid of routesHere) {
+					const ra = routeAgg.get(rid);
+					if (ra) {
+						ra.residents += res;
+						ra.jobs += jobs;
+						ra.drivers += drv;
+						ra.transit += trn;
+					}
+				}
+
+				if (coverCount > 0) {
+					coveredPointIds.add(p.id);
+					s.coveredResidents += res; // union (counted once)
+					s.coveredJobs += jobs;
+					s.coveredDrivers += drv;
+					s.coveredTransit += trn;
+					s.coveredWalking += wlk;
+					if (coverCount >= 2) {
+						s.overlapResidents += res;
+						s.overlapJobs += jobs;
+					}
+				} else if (res > 0 || jobs > 0) {
+					s.gapCount++;
+					s.gapResidents += res;
+					s.gapJobs += jobs;
+				}
+			}
+
+			// Level 2 + journey-level conversion layer. A driver is genuinely convertible
+			// only when BOTH ends are walkable to a station. We also accumulate, per point,
+			// the drivers whose OPPOSITE end is already served – i.e., serving THIS point
+			// would win them. That's the non-geometric insight the circles can't show.
+			const pointConv = new Map();
+			const addConv = (pid, amt) => {
+				if (pid) pointConv.set(pid, (pointConv.get(pid) || 0) + amt);
+			};
+			if (demand.popsMap && demand.popsMap.size) {
+				for (const pop of demand.popsMap.values()) {
+					const lc = pop.lastCommute;
+					if (!lc || !lc.modeChoice) continue;
+					const drv = lc.modeChoice.driving || 0;
+					const homeCovered = coveredPointIds.has(pop.residenceId);
+					const workCovered = coveredPointIds.has(pop.jobId);
+					if (homeCovered && workCovered) {
+						s.convertibleDrivers += drv;
+						s.bothEndsDriving += drv;
+						s.bothEndsTransit += lc.modeChoice.transit || 0;
+					} else if (homeCovered) {
+						s.homeOnlyDrivers += drv;
+					} else if (workCovered) {
+						s.workOnlyDrivers += drv;
+					}
+					if (drv > 0) {
+						if (workCovered) addConv(pop.residenceId, drv); // serve home end → win them
+						if (homeCovered) addConv(pop.jobId, drv); // serve work end → win them
+					}
+				}
+			}
+			// LATENT DEMAND markets: UNCOVERED points whose opposite trip end is already on the
+			// network (one extension would win those would-be riders). Selected & ranked by
+			// POTENTIAL (would-be-rider volume) so the big remote markets show as directional
+			// targets. Encoded value-vs-cost: SIZE (3 tiers) = community potential; COLOR =
+			// cost = distance to your nearest station (green near → red far).
+			const nearestDist = (loc) => {
+				let m = Infinity;
+				for (const st of stations) {
+					if (!st.coords) continue;
+					const d = haversineMeters(loc[0], loc[1], st.coords[0], st.coords[1]);
+					if (d < m) m = d;
+				}
+				return m;
+			};
+			const convCand = [];
+			for (const [pid, val] of pointConv) {
+				if (val <= 0 || coveredPointIds.has(pid)) continue;
+				const pt = demand.points.get(pid);
+				if (!pt || !pt.location) continue;
+				convCand.push({ val: val, loc: pt.location, distM: nearestDist(pt.location) });
+			}
+			convCand.sort((a, b) => b.val - a.val);
+			const top = convCand.slice(0, 30);
+			const maxVal = top.length ? top[0].val : 1;
+			// 3 size tiers by share of the biggest market – a few big dots dominate, minor
+			// markets shrink to background = much less noise than a continuous gradient.
+			const tierRadius = (v) => {
+				const f = v / maxVal;
+				return f >= 0.55 ? 24 : f >= 0.22 ? 14 : 7;
+			};
+			conversionFC = {
+				type: "FeatureCollection",
+				features: top.map((c, i) => ({
+					type: "Feature",
+					properties: { drivers: c.val, distM: c.distM, r: tierRadius(c.val), rank: i + 1 },
+					geometry: { type: "Point", coordinates: [c.loc[0], c.loc[1]] },
+				})),
+			};
+			s.topBuildTargets = top.slice(0, 8).map((c, i) => ({
+				rank: i + 1,
+				drivers: c.val,
+				coords: c.loc,
+				distM: c.distM,
+			}));
+		} else {
+			conversionFC = { type: "FeatureCollection", features: [] };
+		}
+
+		// Stable daily comparison: "Riders" = transit users with this end in walking
+		// reach, "Drivers" = drivers with this end in reach. Both from daily mode share,
+		// so the pair is time-independent (no Late-Night zeroes).
+		const stnFeatures = [];
+		for (const row of per) {
+			row.riders = row.transit;
+			row.potential = row.residents + row.jobs;
+			// capture = transit share of motorized commuters with this end in reach
+			row.capture = row.riders + row.drivers > 0 ? row.riders / (row.riders + row.drivers) : 0;
+			if (row.coords) {
+				stnFeatures.push({
+					type: "Feature",
+					properties: {
+						weight: row.drivers,
+						capture: row.capture,
+						riders: row.riders,
+						drivers: row.drivers,
+						label: (row.capture * 100).toFixed(1) + "%",
+					},
+					geometry: { type: "Point", coordinates: [row.coords[0], row.coords[1]] },
+				});
+			}
+		}
+		stationFC = { type: "FeatureCollection", features: stnFeatures };
+
+		// route center (mean of its stations' coords) for click-to-jump
+		const routeCenters = new Map();
+		for (const stn of stations) {
+			if (!stn.coords) continue;
+			for (const rid of stn.routeIds || []) {
+				if (!routeCenters.has(rid)) routeCenters.set(rid, { x: 0, y: 0, n: 0 });
+				const rc = routeCenters.get(rid);
+				rc.x += stn.coords[0];
+				rc.y += stn.coords[1];
+				rc.n++;
+			}
+		}
+		s.perRoute = routes
+			.map((rt) => {
+				const ra = routeAgg.get(rt.id) || { residents: 0, jobs: 0, drivers: 0, transit: 0 };
+				const rc = routeCenters.get(rt.id);
+				return {
+					id: rt.id,
+					name: rt.name || rt.bullet || "Route",
+					bullet: rt.bullet || "",
+					color: rt.color || "#888",
+					drivers: ra.drivers,
+					residents: ra.residents,
+					jobs: ra.jobs,
+					riders: ra.transit,
+					capture: ra.transit + ra.drivers > 0 ? ra.transit / (ra.transit + ra.drivers) : 0,
+					center: rc && rc.n ? [rc.x / rc.n, rc.y / rc.n] : null,
+				};
+			})
+			.sort((a, b) => b.drivers - a.drivers);
+
+		// biggest conversion opportunity first (most drivers within walking reach)
+		per.sort((a, b) => b.drivers - a.drivers);
+		s.perStation = per;
+		stats = s;
+
+		pushData();
+		try {
+			api.ui.forceUpdate();
+		} catch (e) {}
+	}
+
+	// ---------------------------------------------------------------------------
+	// Rendering – the game frequently drops custom sources/layers, so we
+	// defensively re-register them and only re-push cached data (no recompute).
+	// ---------------------------------------------------------------------------
+
+	// Independent layer toggles (none gate the others).
+	let showCircles = true;
+	let showGaps = false;
+	let showConversion = true;
+	let showStations = false;
+	let showSatellite = true;
+	let satOpacity = 1;
+	let proxyStatus = "unknown"; // "unknown" | "up" | "down" – satellite tile proxy reachability
+	let showBuildings = true; // game's 3D building blocks; hide to reveal clean satellite
+	let activeTab = "planning"; // "setup" | "planning" | "efficiency"
+	// Efficiency peak-hold: getLineMetrics' ridersPerHour/revenuePerHour are LIVE and read 0
+	// at night, so we sample over time and keep each line's PEAK (the busy-period figure).
+	// routeId -> { bullet, color, trainsPerHour, trainCount, capacity, cur[24], prev[24], curDay[24] }
+	// cur = latest peak load per hour; prev = the value from the previous day's same hour; curDay
+	// = which day cur[hr] belongs to (so each hour rolls independently, no global midnight reset).
+	const linePeaks = new Map();
+	let effSaveKey = null; // save we've loaded efficiency data for (persistence is per-save)
+	const EFF_KEY_PREFIX = "cpro_eff_";
+	const expandedLines = new Set(); // routeIds expanded to show their per-station breakdown
+	function sampleEfficiency() {
+		let lm, trains;
+		try {
+			lm = api.gameState.getLineMetrics();
+			trains = api.gameState.getTrains() || [];
+		} catch (e) {
+			return;
+		}
+		if (!Array.isArray(lm)) return;
+		// Per-save persistence: restore this save's stored profile so we don't start blank
+		// (routeIds are stable across reloads). Re-restore whenever the save changes.
+		let saveName;
+		try {
+			saveName = api.gameState.getSaveName();
+		} catch (e) {}
+		if (saveName != null && saveName !== effSaveKey) {
+			effSaveKey = saveName;
+			linePeaks.clear();
+			try {
+				const raw = window.localStorage.getItem(EFF_KEY_PREFIX + saveName);
+				if (raw) {
+					const obj = JSON.parse(raw);
+					for (const k in obj) if (obj[k]) linePeaks.set(k, obj[k]);
+				}
+			} catch (e) {}
+		}
+		let day;
+		try {
+			day = api.gameState.getCurrentDay();
+		} catch (e) {}
+		const capByRoute = {};
+		for (const t of trains) {
+			if (t && t.routeId && t.specs && t.specs.maxCapacity) capByRoute[t.routeId] = t.specs.maxCapacity;
+		}
+		// hour-of-day bucket for the load-by-hour chart (elapsed seconds → 0..23)
+		let elapsed;
+		try {
+			elapsed = api.gameState.getElapsedSeconds();
+		} catch (e) {}
+		const hr = elapsed != null ? Math.floor((((elapsed % 86400) + 86400) % 86400) / 3600) : null;
+		// lazy station-name map (built once per sample, only if a line breakdown needs it)
+		let stnNames = null;
+		const nameOf = (id) => {
+			if (!stnNames) {
+				stnNames = {};
+				try {
+					(api.gameState.getStations() || []).forEach((s) => {
+						if (s && s.id) stnNames[s.id] = s.name;
+					});
+				} catch (e) {}
+			}
+			return stnNames[id] || id;
+		};
+		for (const m of lm) {
+			if (!m || !m.routeId) continue;
+			const prev = linePeaks.get(m.routeId) || {};
+			const cap = (m.trainsPerHour || 0) * (capByRoute[m.routeId] || prev.capacity || 0);
+			const load = cap > 0 ? (m.ridersPerHour || 0) / cap : null;
+			// per-station peak boardings on this line (for the expandable breakdown)
+			const stations = Object.assign({}, prev.stations || {});
+			try {
+				const rr = api.gameState.getRouteRidership(m.routeId);
+				const bs = rr && rr.byStation;
+				if (Array.isArray(bs)) {
+					for (const x of bs) {
+						if (!x || !x.stationId) continue;
+						const ex = stations[x.stationId] || { name: nameOf(x.stationId), peak: 0 };
+						ex.peak = Math.max(ex.peak || 0, x.popCount || 0);
+						if (!ex.name) ex.name = nameOf(x.stationId);
+						stations[x.stationId] = ex;
+					}
+				}
+			} catch (e) {}
+			// Per-HOUR rolling model: each hour keeps its latest peak (cur) + the value from the
+			// PREVIOUS time the clock passed it (prev). An hour only "rolls" when the clock next
+			// enters it on a new day – so nothing wipes globally at midnight; the chart morphs
+			// hour-by-hour. curDay[hr] records which day cur[hr] belongs to.
+			const cur = prev.cur ? prev.cur.slice() : new Array(24).fill(null);
+			const prevArr = prev.prev ? prev.prev.slice() : new Array(24).fill(null);
+			const curDay = prev.curDay ? prev.curDay.slice() : new Array(24).fill(null);
+			if (hr != null && load != null) {
+				if (day != null && curDay[hr] !== day) {
+					if (cur[hr] != null) prevArr[hr] = cur[hr]; // last pass becomes "yesterday this hour"
+					cur[hr] = 0;
+					curDay[hr] = day;
+				}
+				cur[hr] = Math.max(cur[hr] || 0, load);
+			}
+			linePeaks.set(m.routeId, {
+				routeId: m.routeId,
+				bullet: m.routeBullet || prev.bullet || "Line",
+				color: m.routeColor || prev.color || CONV_COLOR,
+				trainsPerHour: m.trainsPerHour != null ? m.trainsPerHour : prev.trainsPerHour || 0,
+				trainCount: m.trainCount != null ? m.trainCount : prev.trainCount || 0,
+				capacity: capByRoute[m.routeId] || prev.capacity || 0,
+				cur: cur,
+				prev: prevArr,
+				curDay: curDay,
+				stations: stations,
+			});
+		}
+		// drop lines no longer in the network, then persist this save's profile to localStorage
+		try {
+			const curIds = {};
+			for (const mm of lm) if (mm && mm.routeId) curIds[mm.routeId] = 1;
+			linePeaks.forEach((v, k) => {
+				if (!curIds[k]) linePeaks.delete(k);
+			});
+			if (saveName != null) {
+				const obj = {};
+				linePeaks.forEach((v, k) => {
+					obj[k] = v;
+				});
+				window.localStorage.setItem(EFF_KEY_PREFIX + saveName, JSON.stringify(obj));
+			}
+		} catch (e) {}
+		// keep the Efficiency tab live as peaks accumulate (it doesn't re-render on its own)
+		if (activeTab === "efficiency") {
+			try {
+				api.ui.forceUpdate();
+			} catch (e) {}
+		}
+	}
+
+	// Bind the instant, event-driven repair listeners to a map. Idempotent per map (rebinds
+	// on a new game's map). Lives at MODULE level + called from onMapReady AND the heal timer,
+	// so style-reload / turn repairs are INSTANT even if onMapReady never fired (a mid-game
+	// hot-reload) -- otherwise only the 300ms backstop heals, causing the flicker.
+	let listenersMap = null;
+	function bindMapListeners(map) {
+		if (!map || map === listenersMap) return;
+		listenersMap = map;
+		try {
+			patchSetStyle(map);
+		} catch (e) {}
+		const reassert = () => {
+			applyVisibility(map);
+			try {
+				requestAnimationFrame(() => applyVisibility(map));
+			} catch (e) {}
+		};
+		const reapply = () => {
+			ensureLayers(map);
+			if (map.getSource(SRC_CATCH)) map.getSource(SRC_CATCH).setData(catchmentFC);
+			if (map.getSource(SRC_CONV)) map.getSource(SRC_CONV).setData(conversionFC);
+			if (map.getSource(SRC_STN)) map.getSource(SRC_STN).setData(stationFC);
+			reassert();
+		};
+		try {
+			map.on("styledata", reapply); // full style reload (2D/3D) – re-add torn-down layers
+			map.on("idle", reassert);
+			map.on("moveend", reassert);
+			map.on("pitchend", reassert); // 2D/3D toggle (pure pitch change)
+			map.on("rotateend", reassert); // turning the map
+			map.on("render", () => {
+				if (showBuildings) return;
+				if (!map.getLayer("buildings-3d")) return;
+				try {
+					if (map.getLayoutProperty("buildings-3d", "visibility") !== "none") {
+						map.setLayoutProperty("buildings-3d", "visibility", "none");
+					}
+				} catch (e) {}
+			});
+		} catch (e) {}
+	}
+	let stationDotScale = 1; // scales the game's station dots (normal + transfer) via CSS
+
+	// Persist toggle state across sessions via localStorage (synchronous + reliable;
+	// persists in the renderer's Local Storage leveldb across full app quits).
+	const PREFS_KEY = "cpro_prefs";
+	function savePrefs() {
+		try {
+			window.localStorage.setItem(
+				PREFS_KEY,
+				JSON.stringify({
+					showCircles,
+					showGaps,
+					showConversion,
+					showStations,
+					showSatellite,
+					showBuildings,
+					satOpacity,
+					satProvider,
+					activeTab,
+					stationDotScale,
+				})
+			);
+		} catch (e) {}
+	}
+
+	// circle-radius expression for OUR station overlay dots, scaled by the slider
+	function stnRadiusExpr() {
+		// uniform dot sized purely by the user's slider – the % (color + label) is the
+		// data; the size is just a visual preference.
+		return 11 * (stationDotScale || 1);
+	}
+	// The "Station dot size" slider scales OUR overlay dots (the colored performance
+	// circles), not the game's markers. Update the live layer + the stored def.
+	function applyDotScale() {
+		// clear the old (wrong-target) CSS hack if it's still around from a prior version
+		try {
+			const old = document.getElementById("cpro-dot-style");
+			if (old) old.textContent = "";
+		} catch (e) {}
+		const expr = stnRadiusExpr();
+		if (stnDef && stnDef.paint) stnDef.paint["circle-radius"] = expr;
+		try {
+			const map = api.utils.getMap();
+			if (map && map.getLayer(LYR_STN)) map.setPaintProperty(LYR_STN, "circle-radius", expr);
+		} catch (e) {}
+	}
+	// Load + apply saved toggle state. Safe to call repeatedly: because every toggle
+	// change calls savePrefs() immediately, the saved state always equals the current
+	// state, so re-loading on map-ready / city-load never clobbers a mid-session change.
+	function loadPrefs() {
+		let raw = null;
+		try {
+			raw = window.localStorage.getItem(PREFS_KEY);
+		} catch (e) {}
+		if (raw == null) return; // nothing saved yet
+		try {
+			const p = JSON.parse(raw);
+			if (p && typeof p === "object") {
+				if (typeof p.showCircles === "boolean") showCircles = p.showCircles;
+				if (typeof p.showGaps === "boolean") showGaps = p.showGaps;
+				if (typeof p.showConversion === "boolean") showConversion = p.showConversion;
+				if (typeof p.showStations === "boolean") showStations = p.showStations;
+				if (typeof p.showSatellite === "boolean") showSatellite = p.showSatellite;
+				if (typeof p.showBuildings === "boolean") showBuildings = p.showBuildings;
+				if (typeof p.satOpacity === "number") satOpacity = p.satOpacity;
+				if (typeof p.satProvider === "string") satProvider = p.satProvider;
+				if (typeof p.activeTab === "string") activeTab = p.activeTab;
+				if (typeof p.stationDotScale === "number") stationDotScale = p.stationDotScale;
+			}
+		} catch (e) {}
+		// apply the restored state to the live map + panel (map may be null at module init)
+		try {
+			const map = api.utils.getMap();
+			if (map) applyVisibility(map);
+			applyDotScale();
+			api.ui.forceUpdate();
+		} catch (e) {}
+	}
+
+	// Restore immediately at load so the very first render uses saved state.
+	loadPrefs();
+
+	function setSatProvider(p) {
+		satProvider = p;
+		savePrefs();
+		try {
+			const map = api.utils.getMap();
+			const src = map && map.getSource(SRC_SAT);
+			if (src && src.setTiles) src.setTiles([satTileUrl()]);
+		} catch (e) {}
+		try {
+			api.ui.forceUpdate();
+		} catch (e) {}
+	}
+	// Detect the satellite tile proxy (we can't START it from the sandboxed renderer, but we can
+	// reach 127.0.0.1 via fetch – connect-src allows it – and guide the user if it's not up).
+	function checkProxyHealth() {
+		try {
+			fetch("http://127.0.0.1:" + SAT_PROXY_PORT + "/health", { cache: "no-store" })
+				.then((r) => (r && r.ok ? r.json() : null))
+				.then((j) => {
+					const s = j && j.status === "ok" ? "up" : "down";
+					if (s !== proxyStatus) {
+						proxyStatus = s;
+						try {
+							api.ui.forceUpdate();
+						} catch (e) {}
+					}
+				})
+				.catch(() => {
+					if (proxyStatus !== "down") {
+						proxyStatus = "down";
+						try {
+							api.ui.forceUpdate();
+						} catch (e) {}
+					}
+				});
+		} catch (e) {}
+	}
+	function copyProxyCmd() {
+		const cmd = "# Run once from the Network Planner mod folder:\nbash install-proxy.sh      # macOS (auto-starts at login)\n# or, any OS, each session:\nnode proxy.js";
+		try {
+			navigator.clipboard.writeText(cmd);
+			api.ui.showNotification("Setup command copied – paste in a terminal", "success");
+		} catch (e) {
+			api.ui.showNotification("Run install-proxy.sh (or node proxy.js) in the mod folder", "info");
+		}
+	}
+
+	// ---- station % injected into the game's own markers (on top + glued) ----
+	// The markers are game-managed maplibregl markers, so anything we append to them
+	// is positioned perfectly. A debounced MutationObserver re-injects after the game
+	// re-renders markers (which it does on pan/zoom).
+	let badgeObserver = null;
+	let badgeScheduled = false;
+	// A marker's anchor (its station's screen position) is the px translate in its
+	// transform – independent of whether the game is currently showing its name label.
+	function markerAnchorPx(marker) {
+		const t = marker.style.transform || "";
+		const m = t.match(/translate\(\s*(-?[\d.]+)px[,\s]+(-?[\d.]+)px/g);
+		if (!m || !m.length) return null;
+		const last = m[m.length - 1].match(/(-?[\d.]+)px[,\s]+(-?[\d.]+)px/);
+		return last ? { x: parseFloat(last[1]), y: parseFloat(last[2]) } : null;
+	}
+	function applyStationBadges() {
+		const map = api.utils.getMap();
+		let markers;
+		try {
+			markers = document.querySelectorAll(".maplibregl-marker");
+		} catch (e) {
+			return;
+		}
+		const showing = !!(showStations && stats && stats.perStation && map);
+		if (!showing) {
+			markers.forEach((m) => {
+				const b = m.querySelector(":scope > .cpro-stn-badge");
+				if (b) b.remove();
+			});
+			return;
+		}
+		// project each station to screen px once
+		const stns = [];
+		for (const r of stats.perStation) {
+			if (!r.coords) continue;
+			let p;
+			try {
+				p = map.project(r.coords);
+			} catch (e) {
+				continue;
+			}
+			stns.push({ x: p.x, y: p.y, cap: r.capture });
+		}
+		markers.forEach((marker) => {
+			let badge = marker.querySelector(":scope > .cpro-stn-badge");
+			const a = markerAnchorPx(marker);
+			let best = null,
+				bestD = 1e9;
+			if (a)
+				for (const s of stns) {
+					const d = (s.x - a.x) * (s.x - a.x) + (s.y - a.y) * (s.y - a.y);
+					if (d < bestD) {
+						bestD = d;
+						best = s;
+					}
+				}
+			// match a station only if its anchor is within ~22px (else it's not a station marker)
+			if (!best || bestD > 22 * 22) {
+				if (badge) badge.remove();
+				return;
+			}
+			if (!badge) {
+				badge = document.createElement("div");
+				badge.className = "cpro-stn-badge";
+				badge.style.cssText =
+					"position:absolute;left:50%;top:-15px;transform:translateX(-50%);font:700 11px sans-serif;color:#fff;padding:0 5px;border-radius:8px;white-space:nowrap;text-shadow:0 0 2px #000;border:1px solid rgba(255,255,255,0.65);pointer-events:none;";
+				marker.appendChild(badge);
+			}
+			// guard with data-* so steady state makes no DOM mutations (no observer loop)
+			const txt = (best.cap * 100).toFixed(1) + "%";
+			if (badge.dataset.v !== txt) {
+				badge.textContent = txt;
+				badge.dataset.v = txt;
+			}
+			const bg = captureColor(best.cap);
+			if (badge.dataset.bg !== bg) {
+				badge.style.background = bg;
+				badge.dataset.bg = bg;
+			}
+		});
+	}
+	function scheduleBadges() {
+		if (badgeScheduled) return;
+		badgeScheduled = true;
+		try {
+			requestAnimationFrame(() => {
+				badgeScheduled = false;
+				applyStationBadges();
+			});
+		} catch (e) {
+			badgeScheduled = false;
+			applyStationBadges();
+		}
+	}
+	function setupBadgeObserver(map) {
+		if (badgeObserver) return;
+		try {
+			const target =
+				(map.getCanvasContainer && map.getCanvasContainer()) ||
+				(map.getContainer && map.getContainer());
+			if (!target) return;
+			badgeObserver = new MutationObserver(() => scheduleBadges());
+			badgeObserver.observe(target, { childList: true, subtree: true });
+		} catch (e) {}
+	}
+
+	function fillColor() {
+		return api.ui.getResolvedTheme() === "dark" ? FILL_DARK : FILL_LIGHT;
+	}
+	function outlineColor() {
+		return api.ui.getResolvedTheme() === "dark" ? OUTLINE_DARK : OUTLINE_LIGHT;
+	}
+
+	// Reuse a font the live style already has glyphs for (the game sets MAP_FONT);
+	// fall back to MapLibre's default stack.
+	function mapTextFont(map) {
+		try {
+			const layers = (map.getStyle() && map.getStyle().layers) || [];
+			for (const l of layers) {
+				const f = l.layout && l.layout["text-font"];
+				if (Array.isArray(f) && f.length) return f;
+			}
+		} catch (e) {}
+		return ["Open Sans Regular", "Arial Unicode MS Regular"];
+	}
+
+	function ensureLayers(map) {
+		if (!map) return;
+		// Satellite raster (via the local proxy) – below the city layers, above 'background'.
+		if (!map.getSource(SRC_SAT)) {
+			api.map.registerSource(SRC_SAT, {
+				type: "raster",
+				tiles: [satTileUrl()],
+				tileSize: 256,
+				minzoom: 0,
+				maxzoom: 19,
+				attribution: "Imagery: Esri / Google / © OpenStreetMap contributors",
+			});
+		}
+		if (!map.getLayer(LYR_SAT)) {
+			satLayerDef = {
+				id: LYR_SAT,
+				type: "raster",
+				source: SRC_SAT,
+				layout: { visibility: showSatellite ? "visible" : "none" },
+				paint: { "raster-opacity": satOpacity, "raster-fade-duration": 0 },
+			};
+			try {
+				api.map.registerLayer(satLayerDef, "buildings-3d");
+			} catch (e) {
+				api.map.registerLayer(satLayerDef);
+			}
+		}
+		if (!map.getSource(SRC_CATCH)) {
+			api.map.registerSource(SRC_CATCH, { type: "geojson", data: catchmentFC });
+		}
+		if (!map.getLayer(LYR_CATCH)) {
+			catchDef = {
+				id: LYR_CATCH,
+				type: "fill",
+				source: SRC_CATCH,
+				layout: { visibility: showCircles ? "visible" : "none" },
+				paint: {
+					"fill-color": fillColor(),
+					"fill-outline-color": outlineColor(),
+				},
+			};
+			api.map.registerLayer(catchDef);
+		}
+		if (!map.getSource(SRC_CONV)) {
+			api.map.registerSource(SRC_CONV, { type: "geojson", data: conversionFC });
+		}
+		if (!map.getLayer(LYR_CONV)) {
+			// latent-demand markets – uncovered would-be-rider pockets.
+			// SIZE (3 tiers) = community potential; COLOR = cost (distance to network):
+			// green = near/cheap (build now) → amber → red = far/expensive (grow toward).
+			// Small (minor) markets are also faded so the big ones dominate = less noise.
+			convDef = {
+				id: LYR_CONV,
+				type: "circle",
+				source: SRC_CONV,
+				layout: { visibility: showConversion ? "visible" : "none" },
+				paint: {
+					"circle-radius": ["get", "r"],
+					"circle-color": [
+						"interpolate",
+						["linear"],
+						["get", "distM"],
+						1800,
+						"#39c35a",
+						4500,
+						"#ffc83d",
+						9000,
+						"#e0563c",
+					],
+					"circle-opacity": ["interpolate", ["linear"], ["get", "r"], 7, 0.5, 24, 0.82],
+					"circle-stroke-color": "#ffffff",
+					"circle-stroke-width": 1.2,
+					"circle-stroke-opacity": 0.85,
+				},
+			};
+			api.map.registerLayer(convDef);
+		}
+		if (!map.getSource(SRC_STN)) {
+			api.map.registerSource(SRC_STN, { type: "geojson", data: stationFC });
+		}
+		if (!map.getLayer(LYR_STN)) {
+			stnDef = {
+				id: LYR_STN,
+				type: "circle",
+				source: SRC_STN,
+				layout: { visibility: showStations ? "visible" : "none" },
+				paint: {
+					// size = driver pool (the opportunity) × the dot-size slider; color = capture
+					"circle-radius": stnRadiusExpr(),
+					"circle-color": [
+						"interpolate",
+						["linear"],
+						["get", "capture"],
+						0,
+						GAP_COLOR, // all drive → red (problem)
+						0.05,
+						CONV_COLOR, // amber
+						0.2,
+						"#86e08c", // converting well → green
+					],
+					"circle-opacity": 0.85,
+					"circle-stroke-color": "#ffffff",
+					"circle-stroke-width": 1.5,
+					"circle-stroke-opacity": 0.9,
+				},
+			};
+			api.map.registerLayer(stnDef);
+		}
+		// (The station % is injected into the game's own station markers – see
+		// applyStationBadges – so it's on top of and glued to each marker.)
+	}
+
+	function pushData() {
+		const map = api.utils.getMap();
+		if (!map) return;
+		ensureLayers(map);
+		if (map.getSource(SRC_CATCH)) map.getSource(SRC_CATCH).setData(catchmentFC);
+		if (map.getSource(SRC_CONV)) map.getSource(SRC_CONV).setData(conversionFC);
+		if (map.getSource(SRC_STN)) map.getSource(SRC_STN).setData(stationFC);
+		applyVisibility(map);
+	}
+
+	function applyVisibility(map) {
+		if (!map) return;
+		// Satellite (mutate the stored def in place so style-reload re-applies keep opacity)
+		if (satLayerDef) {
+			satLayerDef.layout.visibility = showSatellite ? "visible" : "none";
+			satLayerDef.paint["raster-opacity"] = satOpacity;
+		}
+		if (map.getLayer(LYR_SAT)) {
+			map.setLayoutProperty(LYR_SAT, "visibility", showSatellite ? "visible" : "none");
+			try {
+				map.setPaintProperty(LYR_SAT, "raster-opacity", satOpacity);
+			} catch (e) {}
+		}
+		if (map.getLayer("buildings-3d")) {
+			try {
+				map.setLayoutProperty("buildings-3d", "visibility", showBuildings ? "visible" : "none");
+			} catch (e) {}
+		}
+		// Each layer is controlled solely by its own flag – fully independent.
+		// Mutate the stored def's layout.visibility AND set it live, so the engine's
+		// style re-applies (which recreate layers from the stored def) keep the toggle
+		// state instead of resurfacing the layer.
+		const vis = (def, layerId, on) => {
+			const v = on ? "visible" : "none";
+			if (def && def.layout) def.layout.visibility = v;
+			try {
+				if (map.getLayer(layerId)) map.setLayoutProperty(layerId, "visibility", v);
+			} catch (e) {}
+		};
+		vis(catchDef, LYR_CATCH, showCircles);
+		if (map.getLayer(LYR_CATCH)) {
+			try {
+				map.setPaintProperty(LYR_CATCH, "fill-color", fillColor());
+				map.setPaintProperty(LYR_CATCH, "fill-outline-color", outlineColor());
+			} catch (e) {}
+		}
+		vis(convDef, LYR_CONV, showConversion);
+		vis(stnDef, LYR_STN, showStations);
+		applyStationBadges();
+	}
+
+	// THE flicker fix: wrap map.setStyle so that on every style reload we carry the
+	// satellite source + layer from the OLD style into the NEW one. MapLibre then
+	// diffs them, sees the raster source is unchanged, and keeps its tiles in GPU
+	// memory – so the satellite never blanks out or re-fetches during a rebuild.
+	function patchSetStyle(map) {
+		if (!map || map.__cproStylePatched || typeof map.setStyle !== "function") return;
+		map.__cproStylePatched = true;
+		const orig = map.setStyle.bind(map);
+
+		const carryOver = (prev, next) => {
+			try {
+				if (!prev || !next || !Array.isArray(next.layers)) return next;
+				const out = { ...next };
+				if (prev.sources && prev.sources[SRC_SAT]) {
+					out.sources = { ...next.sources, [SRC_SAT]: prev.sources[SRC_SAT] };
+				}
+				const ours = (prev.layers || []).find((l) => l.id === LYR_SAT);
+				if (ours && !next.layers.some((l) => l.id === LYR_SAT)) {
+					const layers = [...next.layers];
+					const idx = layers.findIndex((l) => l.id === "buildings-3d");
+					if (idx >= 0) layers.splice(idx, 0, ours);
+					else layers.unshift(ours);
+					out.layers = layers;
+				}
+				return out;
+			} catch (e) {
+				return next; // any trouble → behave like an unwrapped setStyle
+			}
+		};
+
+		map.setStyle = function (style, opts) {
+			const options = { ...(opts || {}) };
+			const gameTransform = options.transformStyle;
+			options.transformStyle = gameTransform
+				? (p, n) => carryOver(p, gameTransform(p, n))
+				: carryOver;
+			return orig(style, options);
+		};
+	}
+
+	// ---------------------------------------------------------------------------
+	// Lifecycle
+	// ---------------------------------------------------------------------------
+
+	let styleListenerBound = false;
+	let boundMap = null;
+	let buildingsTimerSet = false;
+
+	// Single onMapReady (this hook may keep only one callback – do everything here).
+	api.hooks.onMapReady((map) => {
+		// A new game/city creates a NEW map instance. Our event listeners, badge observer
+		// and panel button were bound to the PREVIOUS map – reset the per-map guards so
+		// everything re-binds to this one. Without this, after returning to the main menu
+		// and loading another game: buildings stop re-hiding, station badges stop updating,
+		// and the toolbar icon goes missing.
+		if (map !== boundMap) {
+			boundMap = map;
+			styleListenerBound = false;
+			panelAdded = false;
+			try {
+				if (badgeObserver) badgeObserver.disconnect();
+			} catch (e) {}
+			badgeObserver = null;
+		}
+
+		try {
+			const c = api.utils.getConstants();
+			if (c && c.WALKING_SPEED != null) WALK_SPEED = c.WALKING_SPEED;
+		} catch (e) {}
+
+		patchSetStyle(map); // install the no-flicker setStyle wrapper (guarded, safe to re-run)
+		setupBadgeObserver(map); // re-inject station % into game markers as they re-render
+		addPanel(); // ensure the toolbar icon exists (covers mod-loaded-mid-game)
+		compute();
+		ensureSatProtocol(); // make sure the Image()-based tile protocol is registered
+		ensureLayers(map);
+		pushData();
+		loadPrefs(); // restore saved toggle state (once); applies + re-renders when ready
+
+		// Re-register on style churn; re-push cached data. No recompute here.
+		// Bind BOTH styledata and idle: full style reloads fire styledata, but
+		// Construction / 2D⇄3D rebuilds settle via 'idle' without a styledata –
+		// re-asserting on idle restores the satellite raster fastest (shortest blank).
+		// Full re-register only on style reloads (layers genuinely got torn down).
+		// Re-assert visibility NOW and again next frame – the game often re-shows its
+		// buildings layer (e.g. on the 2D/3D toggle) a tick AFTER the triggering event,
+		// so a single synchronous re-hide loses the race. The deferred pass wins it.
+		bindMapListeners(map);
+	});
+
+	// Recompute only on meaningful changes.
+	api.hooks.onCityLoad(() => {
+		// onMapReady handles re-binding the panel/listeners for the new map (it fires with
+		// the new map instance); here we just recompute and restore prefs for the new city.
+		lastGoodStationCount = 0; // new city – reset the shrink guard so the first compute proceeds
+		transientSkips = 0;
+		deletionSignaled = false;
+		// (efficiency peaks are reset/restored per-save by the sampler on save change)
+		compute();
+		loadPrefs();
+	});
+	api.hooks.onStationBuilt(() => compute());
+	api.hooks.onStationDeleted(() => {
+		deletionSignaled = true; // a real removal – allow the station count to shrink
+		compute();
+	});
+	api.hooks.onTrackChange(() => compute());
+	api.hooks.onBlueprintPlaced(() => compute());
+	if (api.hooks.onDemandChange) api.hooks.onDemandChange(() => compute());
+
+	function pct(n, d) {
+		if (!d) return "–";
+		return ((100 * n) / d).toFixed(1) + "%";
+	}
+	function fmt(n) {
+		return Math.round(n || 0).toLocaleString();
+	}
+	// success rate color – MUST match the LYR_STN circle's interpolate stops exactly
+	// (0 → red, 0.05 → amber, 0.2 → green), so badges/panel dots match the map dots.
+	const CAPTURE_GREEN = "#86e08c";
+	function lerpHex(a, b, t) {
+		t = Math.max(0, Math.min(1, t));
+		const pa = [parseInt(a.slice(1, 3), 16), parseInt(a.slice(3, 5), 16), parseInt(a.slice(5, 7), 16)];
+		const pb = [parseInt(b.slice(1, 3), 16), parseInt(b.slice(3, 5), 16), parseInt(b.slice(5, 7), 16)];
+		const r = pa.map((v, i) => Math.round(v + (pb[i] - v) * t));
+		return "rgb(" + r[0] + "," + r[1] + "," + r[2] + ")";
+	}
+	function captureColor(c) {
+		c = c == null ? 0 : Math.max(0, c);
+		if (c <= 0.05) return lerpHex(GAP_COLOR, CONV_COLOR, c / 0.05);
+		if (c <= 0.2) return lerpHex(CONV_COLOR, CAPTURE_GREEN, (c - 0.05) / 0.15);
+		return CAPTURE_GREEN;
+	}
+	function rateCell(capture) {
+		return h(
+			"span",
+			{ style: { whiteSpace: "nowrap" } },
+			h("span", {
+				style: {
+					display: "inline-block",
+					width: "8px",
+					height: "8px",
+					borderRadius: "50%",
+					background: captureColor(capture),
+					marginRight: "5px",
+					verticalAlign: "middle",
+				},
+			}),
+			h("span", { style: { verticalAlign: "middle", fontWeight: 600 } }, (capture * 100).toFixed(1) + "%")
+		);
+	}
+	function flyToCoords(coords, zoom) {
+		const map = api.utils.getMap();
+		if (map && coords && coords.length === 2) {
+			try {
+				map.flyTo({ center: [coords[0], coords[1]], zoom: zoom || 14, speed: 1.2 });
+			} catch (e) {}
+		}
+	}
+
+	function StatLine(label, value, sub) {
+		return h(
+			"div",
+			{ style: { display: "flex", justifyContent: "space-between", padding: "2px 0" } },
+			h("span", { style: { opacity: 0.75 } }, label),
+			h(
+				"span",
+				{ style: { fontWeight: 600, textAlign: "right" } },
+				value,
+				sub ? h("span", { style: { opacity: 0.6, fontWeight: 400 } }, " " + sub) : null
+			)
+		);
+	}
+
+	// ---- small presentational helpers (AA-style cards) ----
+
+	function sectionHead(t) {
+		return h(
+			"div",
+			{
+				style: {
+					fontSize: "11px",
+					textTransform: "uppercase",
+					letterSpacing: "0.05em",
+					opacity: 0.55,
+					margin: "14px 0 6px",
+				},
+			},
+			t
+		);
+	}
+
+	function card(children, accent) {
+		return h(
+			"div",
+			{
+				style: {
+					background: "rgba(255,255,255,0.035)",
+					border: "1px solid rgba(128,128,128,0.18)",
+					borderLeft: accent ? "3px solid " + accent : "1px solid rgba(128,128,128,0.18)",
+					borderRadius: "4px",
+					padding: "8px 11px",
+				},
+			},
+			children
+		);
+	}
+
+	function kpiCard(label, value, sub, color) {
+		return h(
+			"div",
+			{
+				style: {
+					flex: "1 1 150px",
+					minWidth: 0,
+					background: "rgba(255,255,255,0.04)",
+					border: "1px solid rgba(128,128,128,0.18)",
+					borderRadius: "4px",
+					padding: "8px 10px",
+				},
+			},
+			h(
+				"div",
+				{ style: { fontSize: "9.5px", textTransform: "uppercase", letterSpacing: "0.04em", opacity: 0.5 } },
+				label
+			),
+			h(
+				"div",
+				{ style: { fontSize: "21px", fontWeight: 700, marginTop: "1px", color: color || "inherit", lineHeight: 1.1 } },
+				value
+			),
+			sub ? h("div", { style: { fontSize: "10px", opacity: 0.55, marginTop: "1px" } }, sub) : null
+		);
+	}
+
+	const toggleBtn = (label, on, dot, onClick) =>
+		h(
+			"button",
+			{
+				onClick: () => {
+					onClick();
+					applyVisibility(api.utils.getMap());
+					savePrefs();
+					try {
+						api.ui.forceUpdate();
+					} catch (e) {}
+				},
+				style: {
+					flex: 1,
+					padding: "5px 8px",
+					cursor: "pointer",
+					borderRadius: "3px",
+					border: "1px solid rgba(128,128,128,0.4)",
+					background: on ? "rgba(255,255,255,0.10)" : "transparent",
+					opacity: on ? 1 : 0.5,
+					fontWeight: 600,
+					fontSize: "12px",
+				},
+			},
+			h("span", { style: { color: dot } }, on ? "● " : "○ "),
+			label
+		);
+
+	function renderPanel() {
+		const s = stats;
+
+		const toggles = h(
+			"div",
+			{ style: { display: "flex", flexWrap: "wrap", gap: "6px" } },
+			toggleBtn("Catchment", showCircles, "#86e08c", () => {
+				showCircles = !showCircles;
+			}),
+			toggleBtn("Latent demand", showConversion, CONV_COLOR, () => {
+				showConversion = !showConversion;
+			}),
+			toggleBtn("Stations", showStations, "#ffffff", () => {
+				showStations = !showStations;
+			}),
+			toggleBtn("Satellite", showSatellite, "#5aa9e6", () => {
+				showSatellite = !showSatellite;
+				if (showSatellite) checkProxyHealth();
+			}),
+			toggleBtn("Buildings", showBuildings, "#bdbdbd", () => {
+				showBuildings = !showBuildings;
+			})
+		);
+
+		const opacityRow = h(
+			"div",
+			{ style: { display: "flex", alignItems: "center", gap: "8px" } },
+			h("span", { style: { fontSize: "11px", opacity: 0.7, whiteSpace: "nowrap", width: "92px" } }, "Satellite opacity"),
+			h("input", {
+				type: "range",
+				min: 0,
+				max: 1,
+				step: 0.05,
+				value: satOpacity,
+				style: { flex: 1 },
+				onChange: (e) => {
+					satOpacity = parseFloat(e.target.value);
+					applyVisibility(api.utils.getMap());
+					savePrefs();
+					try {
+						api.ui.forceUpdate();
+					} catch (e2) {}
+				},
+			}),
+			h("span", { style: { fontSize: "11px", width: "32px", textAlign: "right" } }, Math.round(satOpacity * 100) + "%")
+		);
+
+		const provPill = (p) =>
+			h(
+				"button",
+				{
+					key: p.id,
+					onClick: () => setSatProvider(p.id),
+					title: p.label + " – no key needed",
+					style: {
+						flex: "1 1 auto",
+						padding: "4px 8px",
+						cursor: "pointer",
+						borderRadius: "3px",
+						border: "1px solid rgba(128,128,128,0.4)",
+						background: satProvider === p.id ? "rgba(90,169,230,0.22)" : "transparent",
+						opacity: satProvider === p.id ? 1 : 0.6,
+						fontSize: "11px",
+						fontWeight: 600,
+					},
+				},
+				p.label
+			);
+		const providerRow = h(
+			"div",
+			{ style: { display: "flex", alignItems: "center", gap: "6px", marginBottom: "6px" } },
+			h("span", { style: { fontSize: "11px", opacity: 0.7, whiteSpace: "nowrap", width: "62px" } }, "Imagery"),
+			h("div", { style: { display: "flex", flexWrap: "wrap", gap: "5px", flex: 1 } }, SAT_PROVIDERS.map(provPill))
+		);
+
+		const proxyRow =
+			proxyStatus === "up"
+				? h("div", { style: { marginTop: "7px", fontSize: "11px", color: "#39c35a" } }, "✓ Tile proxy connected")
+				: proxyStatus === "down"
+				? h(
+						"div",
+						{ style: { marginTop: "7px", fontSize: "11px", color: "#ffae57", lineHeight: 1.5 } },
+						"⚠ Satellite needs the local tile proxy (not running). One-time setup: run ",
+						h("code", { style: { background: "rgba(255,255,255,0.1)", padding: "0 4px", borderRadius: "3px" } }, "install-proxy.sh"),
+						" in the mod folder (see README). ",
+						h(
+							"button",
+							{ onClick: copyProxyCmd, style: { marginLeft: "4px", padding: "2px 8px", cursor: "pointer", borderRadius: "3px", border: "1px solid rgba(128,128,128,0.4)", background: "transparent", color: "inherit", fontSize: "10px" } },
+							"Copy command"
+						)
+				  )
+				: h("div", { style: { marginTop: "7px", fontSize: "11px", opacity: 0.5 } }, "Checking proxy…");
+		const satControls = h(
+			"div",
+			{ style: { marginTop: "8px", opacity: showSatellite ? 1 : 0.5 } },
+			providerRow,
+			opacityRow,
+			proxyRow
+		);
+
+		// Station dot size – scales the game's own station markers (normal + transfer).
+		const dotScaleRow = h(
+			"div",
+			{ style: { display: "flex", alignItems: "center", gap: "8px", marginTop: "8px" } },
+			h("span", { style: { fontSize: "11px", opacity: 0.7, whiteSpace: "nowrap", width: "92px" } }, "Station dot size"),
+			h("input", {
+				type: "range",
+				min: 0.5,
+				max: 2.5,
+				step: 0.1,
+				value: stationDotScale,
+				style: { flex: 1 },
+				onChange: (e) => {
+					stationDotScale = parseFloat(e.target.value);
+					applyDotScale();
+					savePrefs();
+					try {
+						api.ui.forceUpdate();
+					} catch (e2) {}
+				},
+			}),
+			h("span", { style: { fontSize: "11px", width: "36px", textAlign: "right" } }, stationDotScale.toFixed(1) + "x")
+		);
+
+		// ---- Concepts / help popover ----
+		const infoHead = (t) =>
+			h(
+				"div",
+				{ style: { fontSize: "10px", textTransform: "uppercase", letterSpacing: "0.05em", opacity: 0.5, margin: "12px 0 5px" } },
+				t
+			);
+		const infoRow = (term, desc, dot) =>
+			h(
+				"div",
+				{ style: { marginBottom: "8px" } },
+				h(
+					"div",
+					{ style: { fontWeight: 700, fontSize: "11.5px", marginBottom: "1px" } },
+					dot
+						? h("span", {
+								style: {
+									display: "inline-block",
+									width: "8px",
+									height: "8px",
+									borderRadius: "50%",
+									background: dot,
+									marginRight: "5px",
+									verticalAlign: "middle",
+								},
+						  })
+						: null,
+					term
+				),
+				h("div", { style: { fontSize: "10.5px", opacity: 0.7, lineHeight: 1.45 } }, desc)
+			);
+		const glossaryContent = h(
+			"div",
+			null,
+					infoHead("Map overlays (the toggles)"),
+					infoRow("Catchment", "Each station's walk catchment circle – about a 30-minute / ~1.8 km walk. The area people can reach on foot to or from the station.", "#86e08c"),
+					infoRow(
+						"Latent demand",
+						"Would-be riders: people who drive today and whose OTHER trip end is already on your network – one extension wins them. SIZE (3 tiers) = community potential (number of would-be riders). COLOR = cost = distance to your nearest station: green = near/cheap (build now) → amber → red = far/expensive (a corridor to grow toward). So big green = do it now; big red = your directional goal; small dots = minor markets. Exact numbers are in the Build here next list – click a row to fly there.",
+						CONV_COLOR
+					),
+					infoRow(
+						"Stations",
+						"A dot at each station showing its SUCCESS RATE. The % (and the dot color, red → amber → green) = of the motorized commuters within walking reach, the share who take transit instead of driving. Low % (red) = lots of nearby drivers not yet won to transit; high % (green) = high transit share. Dot size is just your visual preference (the “Station dot size” slider)."
+					),
+					infoRow("Satellite", "Real photographic imagery as the base map. Pick a source from the Imagery buttons – Esri (default), Google, Hybrid (satellite + labels), or OSM. All free, no key, no setup.", "#5aa9e6"),
+					infoRow("Buildings", "Show/hide the game's own 3D buildings. Turn off for a clean satellite view."),
+
+					infoHead("Headline numbers"),
+					infoRow("Residents / Jobs covered", "Share of the whole city within walking reach of ANY station (counted once)."),
+					infoRow("Capture rate", "Of commuters whose home AND work are both reachable by your network, the share who already take transit instead of driving."),
+					infoRow("Mode shift", "Drivers whose home AND work are BOTH already within a catchment – winnable on TODAY's network (no building needed), because transit only beats driving when the whole door-to-door trip works. They drive anyway = your service-quality opportunity."),
+					infoRow("Home-end / Work-end only", "Drivers served at just one end of their commute. They need a stop at the OTHER end before they can switch to transit."),
+					infoRow("Gap hotspots", "A panel number (not a map layer): uncovered demand – residents and jobs with no station in walking range."),
+					infoRow(
+						"Build here next",
+						"The ranked latent-demand shortlist (matching the map dots): each is the would-be riders at an uncovered market – people whose OTHER trip end is already on your network – plus the distance to your nearest station (the track you'd lay). Ranked by community size. Click a row to fly there."
+					),
+
+					infoHead("Per-route / per-station tables"),
+					infoRow("Rate", "Success rate = transit ÷ (transit + drivers) within reach. The colored dot matches the map dots."),
+					infoRow("Riders", "Transit users with this end (home or work) in walking reach – a daily figure."),
+					infoRow("Drivers", "Drivers likewise – your conversion opportunity at that station/route."),
+					infoRow("Click a row", "Flies the map straight to that station or route."),
+
+					infoHead("Good to know"),
+					infoRow("Daily & time-stable", "All figures are daily – they don't drop to zero at night, so the view is consistent whenever you check."),
+					infoRow("Potential, not the sim", "“Reach” is straight-line walk potential; the game's exact assignment uses full pathfinding. Treat these as planning estimates, not the sim's precise numbers.")
+		);
+
+		// ---- Planning tab content (needs stats) ----
+		let planningContent;
+		if (s) {
+		// Header KPI tiles (fixed, always visible)
+		const kpis = h(
+			"div",
+			{ style: { display: "flex", flexWrap: "wrap", gap: "6px", marginTop: "10px" } },
+			kpiCard("Residents covered", pct(s.coveredResidents, s.cityResidents), pct(s.coveredJobs, s.cityJobs) + " of jobs"),
+			kpiCard("Capture rate", pct(s.bothEndsTransit, s.bothEndsTransit + s.convertibleDrivers), "both ends served", CONV_COLOR),
+			kpiCard("Mode shift", fmt(s.convertibleDrivers), "drivers, both ends served", CONV_COLOR),
+			kpiCard("Gap hotspots", fmt(s.gapCount), fmt(s.gapResidents + s.gapJobs) + " unserved", GAP_COLOR)
+		);
+
+		// Station table – all stations; the body scrolls so it never overflows.
+		const rows = s.perStation.map((r) =>
+			h(
+				"tr",
+				{ key: r.id, onClick: () => flyToCoords(r.coords, 14), title: "Jump to " + r.name, style: { cursor: "pointer" } },
+				h("td", { style: { padding: "3px 6px 3px 0", whiteSpace: "nowrap" } }, r.name),
+				h("td", { style: { padding: "3px 6px", textAlign: "right" } }, rateCell(r.capture)),
+				h("td", { style: { padding: "3px 6px", textAlign: "right", fontWeight: 600 } }, fmt(r.riders)),
+				h("td", { style: { padding: "3px 0", textAlign: "right", color: CONV_COLOR, fontWeight: 600 } }, fmt(r.drivers))
+			)
+		);
+
+		const table = h(
+			"table",
+			{ style: { width: "100%", borderCollapse: "collapse", fontSize: "11.5px" } },
+			h(
+				"thead",
+				null,
+				h(
+					"tr",
+					{ style: { opacity: 0.55, textAlign: "left" } },
+					h("th", { style: { padding: "0 6px 4px 0" } }, "Station"),
+					h("th", { style: { padding: "0 6px 4px", textAlign: "right" } }, "Rate"),
+					h("th", { style: { padding: "0 6px 4px", textAlign: "right" } }, "Riders"),
+					h("th", { style: { padding: "0 0 4px", textAlign: "right", color: CONV_COLOR } }, "Drivers")
+				)
+			),
+			h("tbody", null, rows)
+		);
+
+		// Per-route table – colored bullet, sim riders, drivers in reach (union per line).
+		const routeBullet = (rt) =>
+			h(
+				"span",
+				{
+					style: {
+						display: "inline-block",
+						background: rt.color,
+						color: "#fff",
+						borderRadius: "5px",
+						padding: "1px 8px",
+						fontSize: "10.5px",
+						fontWeight: 700,
+						whiteSpace: "nowrap",
+						maxWidth: "150px",
+						overflow: "hidden",
+						textOverflow: "ellipsis",
+					},
+				},
+				rt.bullet || rt.name
+			);
+		const routeRows = s.perRoute.map((rt) =>
+			h(
+				"tr",
+				{ key: rt.id, onClick: () => flyToCoords(rt.center, 12), title: "Jump to " + rt.name, style: { cursor: "pointer" } },
+				h("td", { style: { padding: "3px 6px 3px 0" } }, routeBullet(rt)),
+				h("td", { style: { padding: "3px 6px", textAlign: "right" } }, rateCell(rt.capture)),
+				h("td", { style: { padding: "3px 6px", textAlign: "right", fontWeight: 600 } }, fmt(rt.riders)),
+				h("td", { style: { padding: "3px 0", textAlign: "right", color: CONV_COLOR, fontWeight: 600 } }, fmt(rt.drivers))
+			)
+		);
+		const routeTable = h(
+			"table",
+			{ style: { width: "100%", borderCollapse: "collapse", fontSize: "11.5px" } },
+			h(
+				"thead",
+				null,
+				h(
+					"tr",
+					{ style: { opacity: 0.55, textAlign: "left" } },
+					h("th", { style: { padding: "0 6px 4px 0" } }, "Route"),
+					h("th", { style: { padding: "0 6px 4px", textAlign: "right" } }, "Rate"),
+					h("th", { style: { padding: "0 6px 4px", textAlign: "right" } }, "Riders"),
+					h("th", { style: { padding: "0 0 4px", textAlign: "right", color: CONV_COLOR } }, "Drivers")
+				)
+			),
+			h("tbody", null, routeRows)
+		);
+
+		// Two logical columns: LEFT = network summary, RIGHT = breakdown tables.
+		const leftCol = h(
+			"div",
+			{ style: { minWidth: 0 } },
+			!s.demandAvailable
+				? h("div", { style: { color: GAP_COLOR, margin: "8px 0" } }, "Demand data not loaded yet – coverage/gaps unavailable.")
+				: null,
+
+			sectionHead("Captured – potential reach (overlaps allowed)"),
+			card([
+				StatLine("Residents", fmt(s.coveredResidents)),
+				StatLine("Jobs", fmt(s.coveredJobs)),
+				StatLine("Double-covered", fmt(s.overlapResidents + s.overlapJobs), "(res+jobs)"),
+			]),
+
+			sectionHead("Mode shift – drivers you could win on today's network"),
+			card(
+				[
+					StatLine(
+						"Mode-shift potential",
+						h("span", { style: { color: CONV_COLOR, fontWeight: 700 } }, fmt(s.convertibleDrivers)),
+						"both ends served"
+					),
+					StatLine("Capture rate", pct(s.bothEndsTransit, s.bothEndsTransit + s.convertibleDrivers), "of both-ends commuters"),
+					StatLine("Home end only", fmt(s.homeOnlyDrivers), "needs a work-end stop"),
+					StatLine("Work end only", fmt(s.workOnlyDrivers), "needs a home-end stop"),
+					StatLine("Near a station (either end)", fmt(s.coveredDrivers)),
+				],
+				CONV_COLOR
+			),
+
+			sectionHead("Build here next – biggest unserved markets"),
+			card(
+				(s.topBuildTargets && s.topBuildTargets.length
+					? s.topBuildTargets.map((t, i) =>
+							h(
+								"div",
+								{
+									key: i,
+									onClick: () => flyToCoords(t.coords, 13),
+									title: "Jump to this build target",
+									style: { display: "flex", justifyContent: "space-between", alignItems: "center", padding: "3px 0", cursor: "pointer" },
+								},
+								h(
+									"span",
+									null,
+									h(
+										"span",
+										{ style: { display: "inline-block", width: "16px", opacity: 0.5, fontWeight: 700, fontSize: "11px" } },
+										(t.rank || i + 1) + "."
+									),
+									h("span", {
+										style: { display: "inline-block", width: "7px", height: "7px", borderRadius: "50%", background: CONV_COLOR, marginRight: "7px", verticalAlign: "middle" },
+									}),
+									h("span", { style: { fontWeight: 600 } }, fmt(t.drivers)),
+									h("span", { style: { opacity: 0.7 } }, " would-be riders")
+								),
+								h(
+									"span",
+									{ style: { fontSize: "11px", opacity: 0.6, whiteSpace: "nowrap" } },
+									(t.distM < 1000 ? Math.round(t.distM) + " m" : (t.distM / 1000).toFixed(1) + " km") + " away"
+								)
+							)
+					  )
+					: [h("div", { style: { opacity: 0.6, fontSize: "11px" } }, "No reachable build-here opportunities right now.")]),
+				CONV_COLOR
+			),
+			h(
+				"div",
+				{ style: { fontSize: "10px", opacity: 0.55, marginTop: "5px" } },
+				"Each = an uncovered market whose drivers' OTHER trip end is already on your network – would-be riders you'd win by reaching it. Ranked by community size. Distance = to your nearest station (the track you'd lay; green→red on the map). Click a row to fly there."
+			),
+
+			h(
+				"div",
+				{ style: { marginTop: "12px", fontSize: "10px", opacity: 0.5 } },
+				"Daily figures (time-stable). “Riders” = transit users with this end (home OR work) in walking reach; “Drivers” = drivers likewise. Rate / station-dot color = transit share of the two (red = mostly driving, green = high transit share). “Mode shift” is stricter: drivers whose home AND work are both within a catchment – winnable on today's network. Click any row to jump to it on the map."
+			)
+		);
+
+		const rightCol = h(
+			"div",
+			{
+				style: {
+					minWidth: 0,
+					marginTop: "12px",
+					paddingTop: "12px",
+					borderTop: "1px solid rgba(128,128,128,0.18)",
+				},
+			},
+			sectionHead("Per-route: riders vs. drivers in reach"),
+			routeTable,
+			sectionHead("Per-station: riders vs. drivers in reach"),
+			table
+		);
+
+		const body = h(
+			"div",
+			{ style: { marginTop: "6px" } },
+			leftCol,
+			rightCol
+		);
+
+			planningContent = h("div", { style: { paddingTop: "12px" } }, kpis, body);
+		} else {
+			planningContent = h("div", { style: { padding: "24px 6px", opacity: 0.7 } }, "Loading demand data…");
+		}
+
+		// ---- Tabs: an underline strip, visually distinct from the pill controls ----
+		const tabBtn = (id, label) =>
+			h(
+				"button",
+				{
+					onClick: () => {
+						activeTab = id;
+						savePrefs();
+						try {
+							api.ui.forceUpdate();
+						} catch (e) {}
+					},
+					style: {
+						flex: "1 1 0",
+						padding: "11px 8px 9px",
+						cursor: "pointer",
+						background: "none",
+						border: "none",
+						borderBottom: activeTab === id ? "2px solid #5aa9e6" : "2px solid transparent",
+						color: "inherit",
+						fontWeight: activeTab === id ? 700 : 600,
+						fontSize: "13px",
+						letterSpacing: "0.02em",
+						opacity: activeTab === id ? 1 : 0.5,
+					},
+				},
+				label
+			);
+		const tabBar = h(
+			"div",
+			{ style: { display: "flex", borderBottom: "1px solid rgba(128,128,128,0.22)" } },
+			tabBtn("setup", "Setup"),
+			tabBtn("planning", "Planning"),
+			tabBtn("efficiency", "Efficiency")
+		);
+
+		// ---- Setup tab: sectioned, with the key + glossary living here ----
+		const setupSection = (title, ...kids) =>
+			h(
+				"div",
+				{ style: { marginBottom: "22px" } },
+				h(
+					"div",
+					{ style: { fontSize: "10.5px", textTransform: "uppercase", letterSpacing: "0.07em", opacity: 0.45, fontWeight: 700, marginBottom: "10px" } },
+					title
+				),
+				...kids
+			);
+		const setupContent = h(
+			"div",
+			{ style: { paddingTop: "18px" } },
+			setupSection("Map layers", toggles),
+			setupSection("Base imagery", satControls),
+			setupSection("Display", dotScaleRow),
+			setupSection("What it all means", glossaryContent)
+		);
+
+		// ---- Efficiency tab: peak-hold Load Factor per line ----
+		const nfmt = (n) => Math.round(n || 0).toLocaleString();
+		const capOf = (p) => (p.trainsPerHour || 0) * (p.capacity || 0); // seats offered per hour
+		const hoursOf = (p) => (p.cur || []).filter((x) => x != null);
+		const avgLoadOf = (p) => {
+			const a = hoursOf(p);
+			return a.length ? a.reduce((s, x) => s + x, 0) / a.length : null;
+		};
+		const peakLoadOf = (p) => {
+			const a = hoursOf(p);
+			return a.length ? Math.max.apply(null, a) : null;
+		};
+		const avgRidersOf = (p) => {
+			const v = avgLoadOf(p);
+			return v == null ? 0 : v * capOf(p);
+		};
+		// Day-over-day change, computed ONLY over hours present in BOTH cur (today) and prev
+		// (previous day) so the baselines are aligned (cur covers every sampled hour, but prev
+		// only fills as each hour re-rolls – averaging them over different hour sets is wrong).
+		// Load-weighted (Σtoday ÷ Σyesterday − 1) so it matches the bars and a −% on a tiny-load
+		// hour barely counts. Guarded against a near-zero baseline.
+		const vsYestOf = (p) => {
+			const cur = p.cur || [],
+				prev = p.prev || [];
+			let sc = 0,
+				sp = 0,
+				n = 0;
+			for (let hr = 0; hr < 24; hr++) {
+				if (cur[hr] != null && prev[hr] != null) {
+					sc += cur[hr];
+					sp += prev[hr];
+					n++;
+				}
+			}
+			return n > 0 && sp / n >= 0.05 ? sc / sp - 1 : null;
+		};
+		const flagOf = (v) =>
+			v == null
+				? { label: "–", color: "#888" }
+				: v >= 1.0
+				? { label: "Overcrowded", color: "#e0563c" }
+				: v >= 0.75
+				? { label: "Near capacity", color: "#ffc83d" }
+				: v >= 0.25
+				? { label: "Healthy", color: "#39c35a" }
+				: { label: "Underused", color: "#5aa9e6" };
+		// Status column = a peak-hour ACTION/TREND (not the absolute level, which the bars
+		// already show): what to do + how the rush is moving vs yesterday's peak.
+		const statusOf = (p) => {
+			const pk = peakLoadOf(p); // today's peak-hour load
+			if (pk == null) return { label: "–", color: "#888" };
+			const avg = avgLoadOf(p); // rolling average load across the hours
+			// off-peak (non-rush) average load – rush = 06-08 & 16-18
+			const cur = p.cur || [];
+			const isRush = (hr) => (hr >= 6 && hr <= 8) || (hr >= 16 && hr <= 18);
+			let ops = 0,
+				opn = 0;
+			for (let hr = 0; hr < 24; hr++) {
+				if (!isRush(hr) && cur[hr] != null) {
+					ops += cur[hr];
+					opn++;
+				}
+			}
+			const offPeak = opn ? ops / opn : null;
+			// peak-hour trend vs yesterday's peak
+			const pv = (p.prev || []).filter((x) => x != null);
+			const peakY = pv.length ? Math.max.apply(null, pv) : null;
+			const trend = peakY != null && peakY >= 0.05 ? (pk - peakY) / peakY : null;
+			if (pk >= 1.0) return { label: "Add peak trains", color: "#e0563c" }; // rush overcrowded
+			if (avg != null && avg < 0.2) return { label: "Over-served", color: "#5aa9e6" }; // wasted all day → cut trains
+			if (pk >= 0.5 && offPeak != null && offPeak < 0.12) return { label: "Trim off-peak", color: "#5aa9e6" }; // busy at rush, dead off-peak → cut Low/Med Demand
+			if (pk >= 0.6 && trend != null && trend >= 0.15) return { label: "Rising – watch peak", color: "#ffc83d" };
+			if (trend != null && trend <= -0.15) return { label: "Easing", color: "#5fe07a" };
+			return { label: "Balanced", color: "#39c35a" };
+		};
+		const peaks = Array.from(linePeaks.values());
+		const effHasData = peaks.some((p) => p.cur && p.cur.some((x) => x != null));
+		// current in-game hour, to highlight "now" in the charts
+		const nowHr = (() => {
+			try {
+				const e = api.gameState.getElapsedSeconds();
+				return e != null ? Math.floor((((e % 86400) + 86400) % 86400) / 3600) : null;
+			} catch (x) {
+				return null;
+			}
+		})();
+		let totRiders = 0,
+			totCap = 0,
+			totTrains = 0;
+		peaks.forEach((p) => {
+			totRiders += avgRidersOf(p);
+			totCap += capOf(p);
+			totTrains += p.trainCount || 0;
+		});
+		const sysLF = totCap > 0 ? totRiders / totCap : null;
+		const effHead = (t, align) =>
+			h("th", { style: { textAlign: align || "left", padding: "0 6px 6px 0", fontWeight: 600, opacity: 0.55, fontSize: "10px", textTransform: "uppercase", letterSpacing: "0.04em" } }, t);
+		const kCard = (label, value, sub, color) =>
+			h(
+				"div",
+				{ style: { flex: "1 1 0", minWidth: "120px", padding: "10px", borderRadius: "4px", border: "1px solid rgba(128,128,128,0.2)" } },
+				h("div", { style: { fontSize: "9.5px", textTransform: "uppercase", letterSpacing: "0.05em", opacity: 0.5, marginBottom: "3px" } }, label),
+				h("div", { style: { fontSize: "20px", fontWeight: 700, color: color || "inherit" } }, value),
+				sub ? h("div", { style: { fontSize: "10.5px", opacity: 0.6, marginTop: "1px" } }, sub) : null
+			);
+		const effRows = peaks
+			.slice()
+			.sort((a, b) => (peakLoadOf(b) || 0) - (peakLoadOf(a) || 0))
+			.map((p, i) => {
+				const avg = avgLoadOf(p);
+				const f = statusOf(p); // peak-hour action/trend (not the absolute level)
+				const vy = vsYestOf(p);
+				return h(
+					"tr",
+					{ key: i, style: { borderTop: "1px solid rgba(128,128,128,0.12)" } },
+					h(
+						"td",
+						{ style: { padding: "6px 6px 6px 0" } },
+						h("span", { style: { display: "inline-block", padding: "1px 8px", borderRadius: "3px", background: p.color, color: "#fff", fontWeight: 700, fontSize: "11px", whiteSpace: "nowrap" } }, p.bullet)
+					),
+					h("td", { style: { padding: "6px 6px", textAlign: "right", fontWeight: 600 } }, nfmt(avgRidersOf(p))),
+					h("td", { style: { padding: "6px 6px", textAlign: "right", opacity: 0.75 } }, (p.trainsPerHour || 0).toFixed(1)),
+					h("td", { style: { padding: "6px 6px", textAlign: "right", fontWeight: 700 } }, avg == null ? "–" : Math.round(avg * 100) + "%"),
+					h(
+						"td",
+						{ style: { padding: "6px 6px", textAlign: "right", fontWeight: 600, fontSize: "11px", whiteSpace: "nowrap", color: vy == null ? "#888" : vy > 0 ? "#ff7a5c" : "#5fe07a" } },
+						vy == null ? "–" : (vy > 0 ? "+" : "") + Math.round(vy * 100) + "%"
+					),
+					h("td", { style: { padding: "6px 0", textAlign: "right", color: f.color, fontWeight: 600, fontSize: "11px", whiteSpace: "nowrap" } }, f.label)
+				);
+			});
+		// Load-by-hour: a 24-bar chart per line. Bar height = peak load that hour, colored by
+		// status – so you can read off which hours each line needs more trains.
+		const CHART_H = 34;
+		const NORM = 1.4; // 140% load = full-height bar
+		const barH = (v) => Math.max(2, (Math.min(v, NORM) / NORM) * CHART_H);
+		// Service-frequency brackets (from the game's Service-frequency tooltips – hardcoded
+		// because the API exposes only the per-bracket train counts, not the hour mapping):
+		//   High (rush): 06-09 & 16-19 · Medium: 05, 09-16, 19 · Low: 00-05 & 20-24.
+		// Shaded behind the bars (violet, distinct from the load colors) so you can tell which
+		// bracket an overcrowded hour falls in → which bracket's train count to raise/lower.
+		const bracketOf = (hr) => {
+			if ((hr >= 6 && hr <= 8) || (hr >= 16 && hr <= 18)) return "high";
+			if (hr <= 4 || hr >= 20) return "low";
+			return "medium";
+		};
+		const bracketBg = (hr) => {
+			const b = bracketOf(hr);
+			return b === "high" ? "rgba(138,120,236,0.20)" : b === "medium" ? "rgba(138,120,236,0.10)" : "rgba(138,120,236,0.035)";
+		};
+		const hourBars = (today, prev) =>
+			h(
+				"div",
+				// paddingTop reserves room ABOVE the bars for the delta labels so they never sit on a bar
+				{ style: { display: "flex", alignItems: "flex-end", gap: "1px", paddingTop: "13px" } },
+				Array.from({ length: 24 }, (_, hr) => {
+					const t = today ? today[hr] : null; // today's load this hour
+					const y = prev ? prev[hr] : null; // yesterday's load this hour
+					// front bar = today if present, else yesterday faded (so the chart stays full
+					// after midnight: future hours show yesterday until today overwrites them)
+					const fv = t != null ? t : y;
+					const fHt = fv != null ? barH(fv) : 2;
+					const fCol = fv != null ? flagOf(fv).color : "rgba(128,128,128,0.18)";
+					const fOp = t != null ? 0.92 : y != null ? 0.34 : 1;
+					// ghost = yesterday's level behind today's bar, for instant compare
+					const showGhost = t != null && y != null;
+					// delta label: only when there's a meaningful baseline (y >= 10%) so a near-zero
+					// yesterday doesn't produce absurd "+1389%", and only when the move is >10%.
+					let delta = null,
+						deltaEl = null;
+					if (t != null && y != null && y >= 0.1) {
+						delta = (t - y) / y;
+						if (Math.abs(delta) >= 0.1) {
+							deltaEl = h(
+								"div",
+								{
+									style: {
+										position: "absolute",
+										left: "-3px",
+										right: "-3px",
+										bottom: fHt + 2 + "px", // always just ABOVE this bar's top
+										textAlign: "center",
+										fontSize: "7px",
+										fontWeight: 700,
+										color: delta > 0 ? "#ff7a5c" : "#5fe07a",
+										whiteSpace: "nowrap",
+										pointerEvents: "none",
+										textShadow: "0 0 3px #000, 0 0 3px #000",
+									},
+								},
+								(delta > 0 ? "+" : "") + Math.round(delta * 100) + "%"
+							);
+						}
+					}
+					return h(
+						"div",
+						{
+							key: hr,
+							title:
+								String(hr).padStart(2, "0") +
+								":00 – " +
+								(t != null ? "today " + Math.round(t * 100) + "%" : "today n/a") +
+								(y != null ? " · yest " + Math.round(y * 100) + "%" : ""),
+							style: { position: "relative", flex: "1 1 0", height: CHART_H + "px", background: "transparent", borderRadius: "1px" },
+						},
+						hr === nowHr ? h("div", { style: { position: "absolute", left: 0, right: 0, top: 0, bottom: 0, background: "rgba(255,255,255,0.14)", borderRadius: "1px" } }) : null,
+						showGhost ? h("div", { style: { position: "absolute", left: 0, right: 0, bottom: 0, height: barH(y) + "px", background: "rgba(255,255,255,0.20)", borderRadius: "1px" } }) : null,
+						fv != null ? h("div", { style: { position: "absolute", left: 0, right: 0, bottom: 0, height: fHt + "px", background: fCol, opacity: fOp, borderRadius: "1px" } }) : null,
+						deltaEl
+					);
+				})
+			);
+		const hourAxis = h(
+			"div",
+			{ style: { display: "flex", marginTop: "2px" } },
+			Array.from({ length: 24 }, (_, hr) =>
+				h("div", { key: hr, style: { flex: "1 1 0", textAlign: "center", fontSize: "8px", opacity: 0.4 } }, hr % 6 === 0 ? String(hr).padStart(2, "0") : "")
+			)
+		);
+		// expandable per-station boardings for a line (busiest stops = where demand concentrates)
+		// station id -> coords, built once (for the click-to-fly in the per-line breakdown)
+		let stnCoords = null;
+		const coordsOf = (id) => {
+			if (!stnCoords) {
+				stnCoords = {};
+				try {
+					(api.gameState.getStations() || []).forEach((s) => {
+						if (s && s.id) stnCoords[s.id] = s.coords;
+					});
+				} catch (e) {}
+			}
+			return stnCoords[id];
+		};
+		// Per-line crowding contributors: that line's busiest boarding stops (boardings = where
+		// demand originates; the game doesn't expose true on-board load). Click a stop to fly to it.
+		const stationBreakdown = (p) => {
+			const sts = Object.keys(p.stations || {})
+				.map((sid) => ({ sid: sid, name: p.stations[sid].name, peak: p.stations[sid].peak || 0 }))
+				.filter((s) => s.peak > 0)
+				.sort((a, b) => b.peak - a.peak);
+			if (!sts.length)
+				return h("div", { style: { fontSize: "10px", opacity: 0.5, margin: "2px 0 10px 18px" } }, "No station boardings recorded yet (they read 0 at night – run a busy hour).");
+			const maxP = sts[0].peak || 1;
+			const total = sts.reduce((s, e) => s + e.peak, 0) || 1;
+			return h(
+				"div",
+				{ style: { margin: "4px 0 10px 18px" } },
+				h("div", { style: { fontSize: "9px", textTransform: "uppercase", letterSpacing: "0.05em", opacity: 0.4, marginBottom: "4px" } }, "Crowding contributors – boardings by station"),
+				sts.map((s, si) =>
+					h(
+						"div",
+						{
+							key: si,
+							onClick: () => {
+								const co = coordsOf(s.sid);
+								if (co) flyToCoords(co, 13);
+							},
+							title: "Jump to " + s.name,
+							style: { display: "flex", alignItems: "center", gap: "6px", marginBottom: "2px", cursor: "pointer" },
+						},
+						h("span", { style: { fontSize: "10px", width: "130px", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", opacity: 0.8 } }, s.name),
+						h(
+							"div",
+							{ style: { flex: "1 1 0", height: "8px", background: "rgba(128,128,128,0.12)", borderRadius: "2px", overflow: "hidden" } },
+							h("div", { style: { width: Math.round((s.peak / maxP) * 100) + "%", height: "100%", background: p.color, opacity: 0.85, borderRadius: "2px" } })
+						),
+						h("span", { style: { fontSize: "10px", width: "48px", textAlign: "right", fontWeight: 600 } }, nfmt(s.peak)),
+						h("span", { style: { fontSize: "10px", width: "38px", textAlign: "right", opacity: 0.6 } }, Math.round((s.peak / total) * 100) + "%")
+					)
+				)
+			);
+		};
+		// Service-frequency legend (once, above all routes) + dashed boundary lines down the charts.
+		const brkRuns = [];
+		for (let h = 0; h < 24; h++) {
+			const b = bracketOf(h);
+			const last = brkRuns[brkRuns.length - 1];
+			if (last && last.b === b) last.len++;
+			else brkRuns.push({ b: b, len: 1 });
+		}
+		const brkLabel = { high: "High", medium: "Med", low: "Low" };
+		const brkColor = { high: "#b3a6f5", medium: "rgba(179,166,245,0.7)", low: "rgba(179,166,245,0.45)" };
+		const bracketLegend = h(
+			"div",
+			{ style: { display: "flex", gap: "1px", height: "14px", marginBottom: "6px" } },
+			brkRuns.map((r, i) =>
+				h(
+					"div",
+					{ key: i, style: { flex: r.len + " 1 0", display: "flex", alignItems: "center", justifyContent: "center", fontSize: "8.5px", fontWeight: 700, color: brkColor[r.b], whiteSpace: "nowrap", overflow: "hidden", borderBottom: "1px solid rgba(138,120,236,0.3)" } },
+					r.len >= 2 ? brkLabel[r.b] : brkLabel[r.b].charAt(0)
+				)
+			)
+		);
+		const boundaries = [];
+		for (let h = 1; h < 24; h++) if (bracketOf(h) !== bracketOf(h - 1)) boundaries.push(h);
+		const dashedLines = h(
+			"div",
+			{ style: { position: "absolute", top: 0, left: 0, right: 0, bottom: 0, pointerEvents: "none" } },
+			boundaries.map((bh, i) =>
+				h("div", { key: i, style: { position: "absolute", top: 0, bottom: 0, left: (bh / 24) * 100 + "%", width: 0, borderLeft: "1px dashed rgba(255,255,255,0.16)" } })
+			)
+		);
+		const hourlySection = h(
+			"div",
+			{ style: { marginTop: "18px" } },
+			h("div", { style: { fontSize: "10px", textTransform: "uppercase", letterSpacing: "0.06em", opacity: 0.45, fontWeight: 700, marginBottom: "10px" } }, "Load by hour"),
+			h(
+				"div",
+				{ style: { position: "relative" } },
+				dashedLines,
+				bracketLegend,
+				peaks.map((p, i) => {
+					const open = expandedLines.has(p.routeId);
+					return h(
+						"div",
+						{ key: i, style: { marginBottom: "12px" } },
+						h(
+							"div",
+							{
+								onClick: () => {
+									if (open) expandedLines.delete(p.routeId);
+									else expandedLines.add(p.routeId);
+									try {
+										api.ui.forceUpdate();
+									} catch (e) {}
+								},
+								title: "Show load by station",
+								style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "4px", cursor: "pointer" },
+							},
+							h(
+								"span",
+								null,
+								h("span", { style: { opacity: 0.5, marginRight: "5px", fontSize: "9px" } }, open ? "▾" : "▸"),
+								h("span", { style: { display: "inline-block", padding: "1px 8px", borderRadius: "3px", background: p.color, color: "#fff", fontWeight: 700, fontSize: "11px" } }, p.bullet)
+							),
+							h("span", { style: { fontSize: "10px", opacity: 0.5 } }, "peak " + (peakLoadOf(p) == null ? "–" : Math.round(peakLoadOf(p) * 100) + "%"))
+						),
+						hourBars(p.cur, p.prev),
+						open ? stationBreakdown(p) : null
+					);
+				}),
+				hourAxis
+			),
+			h(
+				"div",
+				{ style: { fontSize: "10px", opacity: 0.5, marginTop: "6px", lineHeight: 1.5 } },
+				"Each bar = that hour's most recent peak load; the ghost behind it = the previous day's level for that hour; % = change vs then (red = busier, green = relieved). Bars update as the clock passes each hour – nothing wipes at midnight. Lit column = current hour."
+			),
+			h(
+				"div",
+				{ style: { fontSize: "10px", opacity: 0.5, marginTop: "4px", lineHeight: 1.5 } },
+				"Top strip = service-frequency bracket (dashed lines mark the boundaries): High (rush) 06–09 & 16–19 · Medium 05, 09–16, 19 · Low 00–05 & 20–24. A red bar in a High segment = raise High Demand trains."
+			)
+		);
+		const efficiencyContent = h(
+			"div",
+			{ style: { paddingTop: "16px", fontSize: "12px" } },
+			!effHasData
+				? h(
+						"div",
+						{ style: { padding: "20px 4px", opacity: 0.7, lineHeight: 1.5 } },
+						h("div", { style: { fontWeight: 700, marginBottom: "6px" } }, "Run the game to populate efficiency"),
+						"Load Factor reads each line's PEAK ridership, which is 0 at night. Run unpaused through a busy hour and your lines fill in here automatically.",
+						h(
+							"div",
+							{ style: { marginTop: "12px", fontFamily: "monospace", fontSize: "10px", opacity: 0.6 } },
+							(() => {
+								try {
+									const lm = api.gameState.getLineMetrics() || [];
+									return "debug · sampled lines=" + linePeaks.size + " · live getLineMetrics: " + lm.length + " lines, ridersPerHour=" + lm.map((m) => m.ridersPerHour).join("/");
+								} catch (e) {
+									return "debug · sampled lines=" + linePeaks.size + " · getLineMetrics error: " + e;
+								}
+							})()
+						)
+				  )
+				: h(
+						"div",
+						null,
+						h(
+							"div",
+							{ style: { display: "flex", flexWrap: "wrap", gap: "6px", marginBottom: "16px" } },
+							kCard("System load factor", sysLF == null ? "–" : Math.round(sysLF * 100) + "%", "avg riders ÷ seats offered", flagOf(sysLF).color),
+							kCard("Avg riders / hr", nfmt(totRiders), "across all lines"),
+							kCard("Trains", nfmt(totTrains), "deployed")
+						),
+						h("div", { style: { fontSize: "10px", textTransform: "uppercase", letterSpacing: "0.06em", opacity: 0.45, fontWeight: 700, marginBottom: "8px" } }, "Load factor by line"),
+						h(
+							"table",
+							{ style: { width: "100%", borderCollapse: "collapse", fontSize: "11.5px" } },
+							h("thead", null, h("tr", null, effHead("Line"), effHead("Riders/hr", "right"), effHead("Trains/hr", "right"), effHead("Load", "right"), effHead("vs yest", "right"), effHead("Status", "right"))),
+							h("tbody", null, effRows)
+						),
+						hourlySection,
+						h(
+							"div",
+							{ style: { fontSize: "10px", opacity: 0.55, marginTop: "10px", lineHeight: 1.5 } },
+							"Load = riders/hr ÷ (trains/hr × train capacity). Table shows the rolling AVERAGE; ‘vs yest’ = change in that average vs the previous day; Status = a recommendation – Add peak trains (rush full) · Over-served / Trim off-peak (running more than demand needs → cut trains) · Rising / Easing (vs yesterday's peak) · Balanced. Bar colors: ",
+							h("span", { style: { color: "#e0563c" } }, "Overcrowded"),
+							" ≥100% · ",
+							h("span", { style: { color: "#ffc83d" } }, "Near capacity"),
+							" 75–100% · ",
+							h("span", { style: { color: "#39c35a" } }, "Healthy"),
+							" 25–75% · ",
+							h("span", { style: { color: "#5aa9e6" } }, "Underused"),
+							" <25%."
+						)
+				  )
+		);
+
+		const tabContent =
+			activeTab === "setup" ? setupContent : activeTab === "efficiency" ? efficiencyContent : planningContent;
+
+		return h(
+			"div",
+			{
+				style: {
+					position: "relative",
+					display: "flex",
+					flexDirection: "column",
+					height: "100%",
+					minHeight: 0,
+					fontSize: "12px",
+					lineHeight: 1.35,
+				},
+			},
+			tabBar,
+			// fill the panel's actual height and scroll inside it (flex:1 + minHeight:0 is what
+			// makes overflow work – without a bounded height the content just clips at the bottom)
+			h(
+				"div",
+				{ style: { flex: "1 1 auto", minHeight: 0, overflowY: "auto", overflowX: "hidden", padding: "0 14px 16px" } },
+				tabContent
+			)
+		);
+	}
+
+	// Register the panel/toolbar button. Guarded so frequent onMapReady re-fires
+	// (style reloads) don't stack it; re-armed on onCityLoad so a new game's rebuilt
+	// toolbar gets the icon back.
+	let panelAdded = false;
+	function addPanel() {
+		if (panelAdded) return;
+		api.ui.addFloatingPanel({
+			id: "com.davidkarpik.networkplanner.panel",
+			title: "Network Planner",
+			icon: "Radius",
+			defaultWidth: 750,
+			defaultHeight: 600,
+			render: renderPanel,
+		});
+		panelAdded = true;
+	}
+	addPanel();
+
+	// Efficiency peak-hold sampler at MODULE level (not inside onMapReady) – so it runs even
+	// when the mod is hot-reloaded mid-game and onMapReady doesn't re-fire. getLineMetrics is
+	// a no-op until a game is running, so sampling early is harmless.
+	sampleEfficiency();
+	setInterval(sampleEfficiency, 2000);
+
+	// Satellite tile-proxy reachability: check at load and periodically while satellite is on,
+	// so the Setup tab can show a green check or guide the user to run the proxy.
+	checkProxyHealth();
+	setInterval(function () {
+		if (showSatellite) checkProxyHealth();
+	}, 6000);
+
+	// Auto-heal at MODULE level (was inside onMapReady, which a mid-game reload may not
+	// re-fire, leaving the healer off -- so turning the map / Demand Stats dropped our layers
+	// permanently). Re-adds any of our layers the game drops; also re-hides buildings.
+	setInterval(function () {
+		let m;
+		try {
+			m = api.utils.getMap();
+		} catch (e) {}
+		if (!m || !m.getLayer) return;
+			bindMapListeners(m); // ensure instant-repair listeners are on the current map
+		if (!showBuildings) {
+			try {
+				if (m.getLayer("buildings-3d") && m.getLayoutProperty("buildings-3d", "visibility") !== "none") {
+					m.setLayoutProperty("buildings-3d", "visibility", "none");
+				}
+			} catch (e) {}
+		}
+		try {
+			const want = [
+				[LYR_CATCH, showCircles],
+				[LYR_CONV, showConversion],
+				[LYR_STN, showStations],
+				[LYR_SAT, showSatellite],
+			];
+			let needFix = false;
+			for (let i = 0; i < want.length; i++) {
+				const id = want[i][0];
+				const on = want[i][1];
+				const exists = !!m.getLayer(id);
+				if (on && !exists) {
+					needFix = true;
+					break;
+				}
+				if (exists) {
+					const vis = m.getLayoutProperty(id, "visibility") || "visible";
+					if (vis !== (on ? "visible" : "none")) {
+						needFix = true;
+						break;
+					}
+				}
+			}
+			if (needFix) pushData();
+		} catch (e) {}
+	}, 300);
+})();

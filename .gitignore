@@ -1,0 +1,5 @@
+# Runtime artifacts — never commit
+maptiler-key.txt
+tile-cache/
+*.log
+.DS_Store
