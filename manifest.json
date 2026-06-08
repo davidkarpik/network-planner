@@ -1,8 +1,11 @@
 {
-    "id": "com.davidkarpik.networkplanner",
+    "id": "network-planner",
     "name": "Network Planner",
-    "description": "A transit network-planning suite for Subway Builder. Module 1 - Catchment: accurate per-station walk circles, captured residents + jobs, network coverage %, journey-level conversion (drivers whose home AND work are both within reach), a ranked build-here frontier, per-route and per-station riders-vs-drivers, a station performance overlay, and a built-in no-key multi-provider satellite base layer (Esri / Google / OSM / MapTiler). More planning modules to come.",
-    "version": "0.52.0",
+    "description": "A planning and analytics suite that shows where to expand, which lines need trains, when, and where crowding comes from: walk-catchment coverage, mode-shift potential, a ranked build-here-next list, per-line load factor and load-by-hour, and per-line crowding contributors. Optional key-free satellite basemaps.",
+    "dependencies": {
+        "subway-builder": ">=1.0.0"
+    },
+    "version": "0.53.0",
     "author": {
         "name": "David Karpik"
     },

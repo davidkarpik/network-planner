@@ -2,8 +2,9 @@
 
 A planning and analytics suite for [Subway Builder](https://www.subwaybuilder.com). It reads the game's real demand grid and live line metrics to show where to expand, which lines need trains, when, and where crowding comes from.
 
-[![Latest Release](https://img.shields.io/github/v/release/davidkarpik/network-planner?label=stable&color=2ea44f)](https://github.com/davidkarpik/network-planner/releases/latest)
-[![License](https://img.shields.io/github/license/davidkarpik/network-planner)](LICENSE)
+[![Latest Release](https://badgen.net/github/release/davidkarpik/network-planner?label=stable&color=green)](https://github.com/davidkarpik/network-planner/releases/latest)
+[![Download](https://badgen.net/badge/download/releases/green?icon=github)](https://github.com/davidkarpik/network-planner/releases)
+[![License](https://badgen.net/github/license/davidkarpik/network-planner?color=blue)](LICENSE)
 
 ![Network Planner](docs/hero.png)
 
@@ -22,6 +23,12 @@ Network Planner adds a three-tab panel alongside the game. The analysis works wi
 
 ![Planning](docs/planning.png)
 
+![Per-route and per-station riders vs drivers](docs/planning-tables.png)
+
+![Walk catchments and latent demand over satellite](docs/map-catchment.png)
+
+![Station transit share on the map](docs/map-stations.png)
+
 ### Efficiency: how well it runs
 
 - Per-line Load Factor with plain-English advice (Add peak trains, Trim off-peak, Over-served, Rising or Easing vs yesterday, Balanced).
@@ -29,7 +36,9 @@ Network Planner adds a three-tab panel alongside the game. The analysis works wi
 - Expand any line for its crowding contributors, the busiest boarding stops. Click one to fly there.
 - Remembers your data per save, so it is never blank on reload.
 
-![Efficiency](docs/efficiency.png)
+![Load factor and load by hour](docs/efficiency.png)
+
+![The full Efficiency tab](docs/efficiency-full.png)
 
 ![Crowding contributors](docs/contributors.png)
 

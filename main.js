@@ -7,21 +7,22 @@
 	// Config / constants
 	// ---------------------------------------------------------------------------
 
-	// Confirmed from the game internals: catchment is a walk-time budget in seconds.
+	// Catchment is a walk-time budget in seconds, from the game's catchment model + the
+	// catchmentMultiplier exposed per station type:
 	//   catchmentSeconds = catchmentOverride ?? (BASE_CATCHMENT_SECONDS * catchmentMultiplier)
 	//   radiusMeters     = catchmentSeconds * WALKING_SPEED * walkSpeedMultiplier
-	// BASE = MAX_WALK_TO_FROM_STATION = 60 * 30 = 1800s (30 min). For "standard": 1800 m.
+	// BASE is the 30-minute walk budget (60 * 30 = 1800s). For "standard": ~1800 m.
 	const BASE_CATCHMENT_SECONDS = 1800;
 	const CIRCLE_SIDES = 64;
 	const EARTH_R = 6378137; // meters
 
 	let WALK_SPEED = 1; // overwritten from game constants on map ready
 
-	// Catchment fill (matches the established green convention, theme-aware)
-	const FILL_DARK = "#86e08c22";
-	const OUTLINE_DARK = "rgb(75, 119, 74)";
-	const FILL_LIGHT = "#154d4322";
-	const OUTLINE_LIGHT = "rgb(4, 15, 13)";
+	// Catchment fill (theme-aware neutral gray, kept subtle and transparent over the map)
+	const FILL_DARK = "#aeb6c224";
+	const OUTLINE_DARK = "rgb(150, 160, 175)";
+	const FILL_LIGHT = "#52596624";
+	const OUTLINE_LIGHT = "rgb(90, 98, 110)";
 	// Gap (uncovered demand, OUTSIDE any catchment) markers
 	const GAP_COLOR = "#ff5a3c";
 	// Conversion (drivers INSIDE a catchment – addressable, not yet won) markers
@@ -42,7 +43,7 @@
 	// localhost proxy (proxy.js on SAT_PROXY_PORT). All 4 providers are key-free. Below city layers.
 	const SRC_SAT = "cpro-satellite";
 	const LYR_SAT = "cpro-satellite-layer";
-	const SAT_PROXY_PORT = 8080;
+	const SAT_PROXY_PORT = 8454;
 	let satProvider = "esri"; // tile provider; all 4 are key-free
 	function satTileUrl() {
 		return "http://127.0.0.1:" + SAT_PROXY_PORT + "/tile/" + satProvider + "/{z}/{x}/{y}";
@@ -50,13 +51,11 @@
 	const SAT_PROVIDERS = [
 		{ id: "esri", label: "Esri" },
 		{ id: "google", label: "Google" },
-		{ id: "googleHybrid", label: "Hybrid" },
+		{ id: "hybrid", label: "Hybrid" },
 		{ id: "osm", label: "OSM" },
 	];
-	let satLayerDef = null; // kept by reference; mutate paint/layout in place for style reloads
-	// Keep the overlay layers' defs and mutate layout.visibility,
-	// so the engine recreates them with the CURRENT toggle state on style reload / load
-	// (otherwise they come back visible regardless of the toggles).
+	let satLayerDef = null; // current satellite raster layer definition (rebuilt on each (re-)add)
+	// Live layer-definition objects, (re)built by ensureLayers from the current toggle flags.
 	let catchDef = null,
 		gapDef = null,
 		convDef = null,
@@ -67,42 +66,18 @@
 	// Geometry
 	// ---------------------------------------------------------------------------
 
-	const bearingCache = new Map();
-	function getBearings(sides) {
-		if (bearingCache.has(sides)) return bearingCache.get(sides);
-		const arr = new Array(sides);
-		const step = (2 * Math.PI) / sides;
+	// Catchment ring as a local-projection circle: for radii of a few km the equirectangular
+	// lat/lon offset is visually exact and avoids per-vertex great-circle trig. Closed lon/lat ring.
+	function catchmentRing(lon, lat, radiusMeters, sides) {
+		const ring = new Array(sides + 1);
+		const dLat = radiusMeters / 111320; // degrees of latitude per metre
+		const dLon = radiusMeters / (111320 * Math.cos((lat * Math.PI) / 180) || 1e-6);
 		for (let i = 0; i < sides; i++) {
-			const b = i * step;
-			arr[i] = { sinB: Math.sin(b), cosB: Math.cos(b) };
+			const a = (i / sides) * 2 * Math.PI;
+			ring[i] = [lon + dLon * Math.cos(a), lat + dLat * Math.sin(a)];
 		}
-		bearingCache.set(sides, arr);
-		return arr;
-	}
-
-	// True geodesic circle, computed per-station (no offset-translation approximation).
-	function geodesicCircle(lon, lat, radiusMeters, sides) {
-		const coords = new Array(sides + 1);
-		const degToRad = Math.PI / 180;
-		const radToDeg = 180 / Math.PI;
-		const lat0 = lat * degToRad;
-		const lon0 = lon * degToRad;
-		const sinLat0 = Math.sin(lat0);
-		const cosLat0 = Math.cos(lat0);
-		const ad = radiusMeters / EARTH_R;
-		const sinAD = Math.sin(ad);
-		const cosAD = Math.cos(ad);
-		const bearings = getBearings(sides);
-		for (let i = 0; i < sides; i++) {
-			const { sinB, cosB } = bearings[i];
-			const latR = Math.asin(sinLat0 * cosAD + cosLat0 * sinAD * cosB);
-			const lonR =
-				lon0 +
-				Math.atan2(sinB * sinAD * cosLat0, cosAD - sinLat0 * Math.sin(latR));
-			coords[i] = [lonR * radToDeg, latR * radToDeg];
-		}
-		coords[sides] = coords[0];
-		return coords;
+		ring[sides] = ring[0];
+		return ring;
 	}
 
 	function haversineMeters(lon1, lat1, lon2, lat2) {
@@ -225,7 +200,7 @@
 				properties: { stationId: stn.id },
 				geometry: {
 					type: "Polygon",
-					coordinates: [geodesicCircle(c[0], c[1], r, CIRCLE_SIDES)],
+					coordinates: [catchmentRing(c[0], c[1], r, CIRCLE_SIDES)],
 				},
 			});
 		}
@@ -619,10 +594,7 @@
 	function bindMapListeners(map) {
 		if (!map || map === listenersMap) return;
 		listenersMap = map;
-		try {
-			patchSetStyle(map);
-		} catch (e) {}
-		const reassert = () => {
+		const refreshOverlay = () => {
 			applyVisibility(map);
 			try {
 				requestAnimationFrame(() => applyVisibility(map));
@@ -633,14 +605,14 @@
 			if (map.getSource(SRC_CATCH)) map.getSource(SRC_CATCH).setData(catchmentFC);
 			if (map.getSource(SRC_CONV)) map.getSource(SRC_CONV).setData(conversionFC);
 			if (map.getSource(SRC_STN)) map.getSource(SRC_STN).setData(stationFC);
-			reassert();
+			refreshOverlay();
 		};
 		try {
 			map.on("styledata", reapply); // full style reload (2D/3D) – re-add torn-down layers
-			map.on("idle", reassert);
-			map.on("moveend", reassert);
-			map.on("pitchend", reassert); // 2D/3D toggle (pure pitch change)
-			map.on("rotateend", reassert); // turning the map
+			map.on("idle", refreshOverlay);
+			map.on("moveend", refreshOverlay);
+			map.on("pitchend", refreshOverlay); // 2D/3D toggle (pure pitch change)
+			map.on("rotateend", refreshOverlay); // turning the map
 			map.on("render", () => {
 				if (showBuildings) return;
 				if (!map.getLayer("buildings-3d")) return;
@@ -652,7 +624,7 @@
 			});
 		} catch (e) {}
 	}
-	let stationDotScale = 1; // scales the game's station dots (normal + transfer) via CSS
+	let stationDotScale = 1; // size multiplier for our station markers and % labels
 
 	// Persist toggle state across sessions via localStorage (synchronous + reliable;
 	// persists in the renderer's Local Storage leveldb across full app quits).
@@ -686,16 +658,14 @@
 	// The "Station dot size" slider scales OUR overlay dots (the colored performance
 	// circles), not the game's markers. Update the live layer + the stored def.
 	function applyDotScale() {
-		// clear the old (wrong-target) CSS hack if it's still around from a prior version
-		try {
-			const old = document.getElementById("cpro-dot-style");
-			if (old) old.textContent = "";
-		} catch (e) {}
 		const expr = stnRadiusExpr();
 		if (stnDef && stnDef.paint) stnDef.paint["circle-radius"] = expr;
+		const textSize = 11 * (stationDotScale || 1);
+		if (stnLabelDef && stnLabelDef.layout) stnLabelDef.layout["text-size"] = textSize;
 		try {
 			const map = api.utils.getMap();
 			if (map && map.getLayer(LYR_STN)) map.setPaintProperty(LYR_STN, "circle-radius", expr);
+			if (map && map.getLayer(LYR_STN_LABEL)) map.setLayoutProperty(LYR_STN_LABEL, "text-size", textSize);
 		} catch (e) {}
 	}
 	// Load + apply saved toggle state. Safe to call repeatedly: because every toggle
@@ -717,7 +687,7 @@
 				if (typeof p.showSatellite === "boolean") showSatellite = p.showSatellite;
 				if (typeof p.showBuildings === "boolean") showBuildings = p.showBuildings;
 				if (typeof p.satOpacity === "number") satOpacity = p.satOpacity;
-				if (typeof p.satProvider === "string") satProvider = p.satProvider;
+				if (typeof p.satProvider === "string" && SAT_PROVIDERS.some((sp) => sp.id === p.satProvider)) satProvider = p.satProvider;
 				if (typeof p.activeTab === "string") activeTab = p.activeTab;
 				if (typeof p.stationDotScale === "number") stationDotScale = p.stationDotScale;
 			}
@@ -750,10 +720,10 @@
 	// reach 127.0.0.1 via fetch – connect-src allows it – and guide the user if it's not up).
 	function checkProxyHealth() {
 		try {
-			fetch("http://127.0.0.1:" + SAT_PROXY_PORT + "/health", { cache: "no-store" })
+			fetch("http://127.0.0.1:" + SAT_PROXY_PORT + "/status", { cache: "no-store" })
 				.then((r) => (r && r.ok ? r.json() : null))
 				.then((j) => {
-					const s = j && j.status === "ok" ? "up" : "down";
+					const s = j && j.ok ? "up" : "down";
 					if (s !== proxyStatus) {
 						proxyStatus = s;
 						try {
@@ -781,111 +751,6 @@
 		}
 	}
 
-	// ---- station % injected into the game's own markers (on top + glued) ----
-	// The markers are game-managed maplibregl markers, so anything we append to them
-	// is positioned perfectly. A debounced MutationObserver re-injects after the game
-	// re-renders markers (which it does on pan/zoom).
-	let badgeObserver = null;
-	let badgeScheduled = false;
-	// A marker's anchor (its station's screen position) is the px translate in its
-	// transform – independent of whether the game is currently showing its name label.
-	function markerAnchorPx(marker) {
-		const t = marker.style.transform || "";
-		const m = t.match(/translate\(\s*(-?[\d.]+)px[,\s]+(-?[\d.]+)px/g);
-		if (!m || !m.length) return null;
-		const last = m[m.length - 1].match(/(-?[\d.]+)px[,\s]+(-?[\d.]+)px/);
-		return last ? { x: parseFloat(last[1]), y: parseFloat(last[2]) } : null;
-	}
-	function applyStationBadges() {
-		const map = api.utils.getMap();
-		let markers;
-		try {
-			markers = document.querySelectorAll(".maplibregl-marker");
-		} catch (e) {
-			return;
-		}
-		const showing = !!(showStations && stats && stats.perStation && map);
-		if (!showing) {
-			markers.forEach((m) => {
-				const b = m.querySelector(":scope > .cpro-stn-badge");
-				if (b) b.remove();
-			});
-			return;
-		}
-		// project each station to screen px once
-		const stns = [];
-		for (const r of stats.perStation) {
-			if (!r.coords) continue;
-			let p;
-			try {
-				p = map.project(r.coords);
-			} catch (e) {
-				continue;
-			}
-			stns.push({ x: p.x, y: p.y, cap: r.capture });
-		}
-		markers.forEach((marker) => {
-			let badge = marker.querySelector(":scope > .cpro-stn-badge");
-			const a = markerAnchorPx(marker);
-			let best = null,
-				bestD = 1e9;
-			if (a)
-				for (const s of stns) {
-					const d = (s.x - a.x) * (s.x - a.x) + (s.y - a.y) * (s.y - a.y);
-					if (d < bestD) {
-						bestD = d;
-						best = s;
-					}
-				}
-			// match a station only if its anchor is within ~22px (else it's not a station marker)
-			if (!best || bestD > 22 * 22) {
-				if (badge) badge.remove();
-				return;
-			}
-			if (!badge) {
-				badge = document.createElement("div");
-				badge.className = "cpro-stn-badge";
-				badge.style.cssText =
-					"position:absolute;left:50%;top:-15px;transform:translateX(-50%);font:700 11px sans-serif;color:#fff;padding:0 5px;border-radius:8px;white-space:nowrap;text-shadow:0 0 2px #000;border:1px solid rgba(255,255,255,0.65);pointer-events:none;";
-				marker.appendChild(badge);
-			}
-			// guard with data-* so steady state makes no DOM mutations (no observer loop)
-			const txt = (best.cap * 100).toFixed(1) + "%";
-			if (badge.dataset.v !== txt) {
-				badge.textContent = txt;
-				badge.dataset.v = txt;
-			}
-			const bg = captureColor(best.cap);
-			if (badge.dataset.bg !== bg) {
-				badge.style.background = bg;
-				badge.dataset.bg = bg;
-			}
-		});
-	}
-	function scheduleBadges() {
-		if (badgeScheduled) return;
-		badgeScheduled = true;
-		try {
-			requestAnimationFrame(() => {
-				badgeScheduled = false;
-				applyStationBadges();
-			});
-		} catch (e) {
-			badgeScheduled = false;
-			applyStationBadges();
-		}
-	}
-	function setupBadgeObserver(map) {
-		if (badgeObserver) return;
-		try {
-			const target =
-				(map.getCanvasContainer && map.getCanvasContainer()) ||
-				(map.getContainer && map.getContainer());
-			if (!target) return;
-			badgeObserver = new MutationObserver(() => scheduleBadges());
-			badgeObserver.observe(target, { childList: true, subtree: true });
-		} catch (e) {}
-	}
 
 	function fillColor() {
 		return api.ui.getResolvedTheme() === "dark" ? FILL_DARK : FILL_LIGHT;
@@ -1005,7 +870,7 @@
 						0.05,
 						CONV_COLOR, // amber
 						0.2,
-						"#86e08c", // converting well → green
+						"#4fd388", // converting well → green
 					],
 					"circle-opacity": 0.85,
 					"circle-stroke-color": "#ffffff",
@@ -1015,8 +880,30 @@
 			};
 			api.map.registerLayer(stnDef);
 		}
-		// (The station % is injected into the game's own station markers – see
-		// applyStationBadges – so it's on top of and glued to each marker.)
+		// Station success-rate % drawn as a GL text layer on our own source (colored to match
+		// the dot). Rendered by the map, not injected into the game's DOM markers.
+		if (!map.getLayer(LYR_STN_LABEL)) {
+			stnLabelDef = {
+				id: LYR_STN_LABEL,
+				type: "symbol",
+				source: SRC_STN,
+				layout: {
+					"text-field": ["get", "label"],
+					"text-font": mapTextFont(map),
+					"text-size": 11 * (stationDotScale || 1),
+					"text-allow-overlap": true,
+					"text-ignore-placement": true,
+					"text-offset": [0, -1.2],
+					visibility: showStations ? "visible" : "none",
+				},
+				paint: {
+					"text-color": ["interpolate", ["linear"], ["get", "capture"], 0, GAP_COLOR, 0.05, CONV_COLOR, 0.2, "#4fd388"],
+					"text-halo-color": "rgba(0,0,0,0.85)",
+					"text-halo-width": 1.6,
+				},
+			};
+			api.map.registerLayer(stnLabelDef);
+		}
 	}
 
 	function pushData() {
@@ -1031,11 +918,9 @@
 
 	function applyVisibility(map) {
 		if (!map) return;
-		// Satellite (mutate the stored def in place so style-reload re-applies keep opacity)
-		if (satLayerDef) {
-			satLayerDef.layout.visibility = showSatellite ? "visible" : "none";
-			satLayerDef.paint["raster-opacity"] = satOpacity;
-		}
+		// Satellite: set opacity + visibility on the live layer. On a style reload ensureLayers
+		// rebuilds the def from the current satOpacity/showSatellite values, so nothing needs
+		// to be persisted on the def itself.
 		if (map.getLayer(LYR_SAT)) {
 			map.setLayoutProperty(LYR_SAT, "visibility", showSatellite ? "visible" : "none");
 			try {
@@ -1047,68 +932,27 @@
 				map.setLayoutProperty("buildings-3d", "visibility", showBuildings ? "visible" : "none");
 			} catch (e) {}
 		}
-		// Each layer is controlled solely by its own flag – fully independent.
-		// Mutate the stored def's layout.visibility AND set it live, so the engine's
-		// style re-applies (which recreate layers from the stored def) keep the toggle
-		// state instead of resurfacing the layer.
-		const vis = (def, layerId, on) => {
+		// Each overlay layer is controlled solely by its own flag, fully independent. Set
+		// visibility on the live layer; on a style reload ensureLayers rebuilds each def from
+		// its current flag, so the toggle state is preserved either way.
+		const vis = (layerId, on) => {
 			const v = on ? "visible" : "none";
-			if (def && def.layout) def.layout.visibility = v;
 			try {
 				if (map.getLayer(layerId)) map.setLayoutProperty(layerId, "visibility", v);
 			} catch (e) {}
 		};
-		vis(catchDef, LYR_CATCH, showCircles);
+		vis(LYR_CATCH, showCircles);
 		if (map.getLayer(LYR_CATCH)) {
 			try {
 				map.setPaintProperty(LYR_CATCH, "fill-color", fillColor());
 				map.setPaintProperty(LYR_CATCH, "fill-outline-color", outlineColor());
 			} catch (e) {}
 		}
-		vis(convDef, LYR_CONV, showConversion);
-		vis(stnDef, LYR_STN, showStations);
-		applyStationBadges();
+		vis(LYR_CONV, showConversion);
+		vis(LYR_STN, showStations);
+		vis(LYR_STN_LABEL, showStations);
 	}
 
-	// THE flicker fix: wrap map.setStyle so that on every style reload we carry the
-	// satellite source + layer from the OLD style into the NEW one. MapLibre then
-	// diffs them, sees the raster source is unchanged, and keeps its tiles in GPU
-	// memory – so the satellite never blanks out or re-fetches during a rebuild.
-	function patchSetStyle(map) {
-		if (!map || map.__cproStylePatched || typeof map.setStyle !== "function") return;
-		map.__cproStylePatched = true;
-		const orig = map.setStyle.bind(map);
-
-		const carryOver = (prev, next) => {
-			try {
-				if (!prev || !next || !Array.isArray(next.layers)) return next;
-				const out = { ...next };
-				if (prev.sources && prev.sources[SRC_SAT]) {
-					out.sources = { ...next.sources, [SRC_SAT]: prev.sources[SRC_SAT] };
-				}
-				const ours = (prev.layers || []).find((l) => l.id === LYR_SAT);
-				if (ours && !next.layers.some((l) => l.id === LYR_SAT)) {
-					const layers = [...next.layers];
-					const idx = layers.findIndex((l) => l.id === "buildings-3d");
-					if (idx >= 0) layers.splice(idx, 0, ours);
-					else layers.unshift(ours);
-					out.layers = layers;
-				}
-				return out;
-			} catch (e) {
-				return next; // any trouble → behave like an unwrapped setStyle
-			}
-		};
-
-		map.setStyle = function (style, opts) {
-			const options = { ...(opts || {}) };
-			const gameTransform = options.transformStyle;
-			options.transformStyle = gameTransform
-				? (p, n) => carryOver(p, gameTransform(p, n))
-				: carryOver;
-			return orig(style, options);
-		};
-	}
 
 	// ---------------------------------------------------------------------------
 	// Lifecycle
@@ -1120,19 +964,15 @@
 
 	// Single onMapReady (this hook may keep only one callback – do everything here).
 	api.hooks.onMapReady((map) => {
-		// A new game/city creates a NEW map instance. Our event listeners, badge observer
-		// and panel button were bound to the PREVIOUS map – reset the per-map guards so
-		// everything re-binds to this one. Without this, after returning to the main menu
-		// and loading another game: buildings stop re-hiding, station badges stop updating,
-		// and the toolbar icon goes missing.
+		// A new game/city creates a NEW map instance. Our event listeners and panel button
+		// were bound to the PREVIOUS map – reset the per-map guards so everything re-binds to
+		// this one. Without this, after returning to the main menu and loading another game:
+		// buildings stop re-hiding, the overlay layers stop refreshing, and the toolbar icon
+		// goes missing.
 		if (map !== boundMap) {
 			boundMap = map;
 			styleListenerBound = false;
-			panelAdded = false;
-			try {
-				if (badgeObserver) badgeObserver.disconnect();
-			} catch (e) {}
-			badgeObserver = null;
+			toolbarMounted = false;
 		}
 
 		try {
@@ -1140,8 +980,6 @@
 			if (c && c.WALKING_SPEED != null) WALK_SPEED = c.WALKING_SPEED;
 		} catch (e) {}
 
-		patchSetStyle(map); // install the no-flicker setStyle wrapper (guarded, safe to re-run)
-		setupBadgeObserver(map); // re-inject station % into game markers as they re-render
 		addPanel(); // ensure the toolbar icon exists (covers mod-loaded-mid-game)
 		compute();
 		ensureSatProtocol(); // make sure the Image()-based tile protocol is registered
@@ -1188,8 +1026,8 @@
 		return Math.round(n || 0).toLocaleString();
 	}
 	// success rate color – MUST match the LYR_STN circle's interpolate stops exactly
-	// (0 → red, 0.05 → amber, 0.2 → green), so badges/panel dots match the map dots.
-	const CAPTURE_GREEN = "#86e08c";
+	// (0 → red, 0.05 → amber, 0.2 → green), so the panel's capture dots match the map dots.
+	const CAPTURE_GREEN = "#4fd388";
 	function lerpHex(a, b, t) {
 		t = Math.max(0, Math.min(1, t));
 		const pa = [parseInt(a.slice(1, 3), 16), parseInt(a.slice(3, 5), 16), parseInt(a.slice(5, 7), 16)];
@@ -1339,7 +1177,7 @@
 		const toggles = h(
 			"div",
 			{ style: { display: "flex", flexWrap: "wrap", gap: "6px" } },
-			toggleBtn("Catchment", showCircles, "#86e08c", () => {
+			toggleBtn("Catchment", showCircles, "#9aa5b0", () => {
 				showCircles = !showCircles;
 			}),
 			toggleBtn("Latent demand", showConversion, CONV_COLOR, () => {
@@ -1433,7 +1271,7 @@
 			proxyRow
 		);
 
-		// Station dot size – scales the game's own station markers (normal + transfer).
+		// Station dot size – scales our overlay station dots and their % labels.
 		const dotScaleRow = h(
 			"div",
 			{ style: { display: "flex", alignItems: "center", gap: "8px", marginTop: "8px" } },
@@ -1492,7 +1330,7 @@
 			"div",
 			null,
 					infoHead("Map overlays (the toggles)"),
-					infoRow("Catchment", "Each station's walk catchment circle – about a 30-minute / ~1.8 km walk. The area people can reach on foot to or from the station.", "#86e08c"),
+					infoRow("Catchment", "Each station's walk catchment circle – about a 30-minute / ~1.8 km walk. The area people can reach on foot to or from the station.", "#9aa5b0"),
 					infoRow(
 						"Latent demand",
 						"Would-be riders: people who drive today and whose OTHER trip end is already on your network – one extension wins them. SIZE (3 tiers) = community potential (number of would-be riders). COLOR = cost = distance to your nearest station: green = near/cheap (build now) → amber → red = far/expensive (a corridor to grow toward). So big green = do it now; big red = your directional goal; small dots = minor markets. Exact numbers are in the Build here next list – click a row to fly there.",
@@ -2224,9 +2062,9 @@
 	// Register the panel/toolbar button. Guarded so frequent onMapReady re-fires
 	// (style reloads) don't stack it; re-armed on onCityLoad so a new game's rebuilt
 	// toolbar gets the icon back.
-	let panelAdded = false;
+	let toolbarMounted = false;
 	function addPanel() {
-		if (panelAdded) return;
+		if (toolbarMounted) return;
 		api.ui.addFloatingPanel({
 			id: "com.davidkarpik.networkplanner.panel",
 			title: "Network Planner",
@@ -2235,7 +2073,7 @@
 			defaultHeight: 600,
 			render: renderPanel,
 		});
-		panelAdded = true;
+		toolbarMounted = true;
 	}
 	addPanel();
 
@@ -2274,6 +2112,7 @@
 				[LYR_CATCH, showCircles],
 				[LYR_CONV, showConversion],
 				[LYR_STN, showStations],
+				[LYR_STN_LABEL, showStations],
 				[LYR_SAT, showSatellite],
 			];
 			let needFix = false;
