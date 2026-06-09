@@ -1,3 +1,9 @@
+/*
+ * Network Planner - a planning and analytics mod for Subway Builder
+ * Copyright (C) 2026 David Karpik
+ * Licensed under the GNU General Public License v3.0 only (GPL-3.0-only);
+ * see the LICENSE file for the full text.
+ */
 (function () {
 	const api = window.SubwayBuilderAPI;
 	const React = api.utils.React;
@@ -27,6 +33,13 @@
 	const GAP_COLOR = "#ff5a3c";
 	// Conversion (drivers INSIDE a catchment – addressable, not yet won) markers
 	const CONV_COLOR = "#ffc83d";
+	// Steady-demand accent (panel cards / KPI / toggle dot). Red, matching the demand-hub areas
+	// and the game's own red = demand convention.
+	const HUB_ACCENT = "#ef5350";
+	// Demand-hub area fills: residential = RED, jobs = faint VIOLET (distinct enough to read home-
+	// vs-job on the map; the 1..10 numbers reinforce it). Both are faint background areas.
+	const HUB_HOME = "#c0392b"; // red (residential)
+	const HUB_JOB = "#8366f0"; // violet (jobs)
 
 	const SRC_CATCH = "cpro-catchments";
 	const LYR_CATCH = "cpro-catchment-fill";
@@ -37,6 +50,11 @@
 	const SRC_STN = "cpro-stations";
 	const LYR_STN = "cpro-station-markers";
 	const LYR_STN_LABEL = "cpro-station-labels";
+	// First-line finder (greenfield): demand centers (clusters of residents/jobs), shown before
+	// any station exists to answer "where does my first line go?"
+	const SRC_CEN = "cpro-centers";
+	const LYR_CEN = "cpro-center-markers";
+	const LYR_CEN_LABEL = "cpro-center-labels";
 	// Satellite imagery overlay (real photographic tiles via the local proxy). The game hard-
 	// blocks all external tile domains (only subwaybuilder.com / protomaps / localhost / 127.0.0.1
 	// load – proven: even a plain <img> to an external host fails), so tiles MUST come through the
@@ -60,7 +78,9 @@
 		gapDef = null,
 		convDef = null,
 		stnDef = null,
-		stnLabelDef = null;
+		stnLabelDef = null,
+		cenDef = null,
+		cenLabelDef = null;
 
 	// ---------------------------------------------------------------------------
 	// Geometry
@@ -75,6 +95,26 @@
 		for (let i = 0; i < sides; i++) {
 			const a = (i / sides) * 2 * Math.PI;
 			ring[i] = [lon + dLon * Math.cos(a), lat + dLat * Math.sin(a)];
+		}
+		ring[sides] = ring[0];
+		return ring;
+	}
+
+	// Irregular "blob" ring: an organic, aerial demand-area outline (deterministic from `seed`, so
+	// each hub keeps a stable unique shape across recomputes). Used for the greenfield demand hubs
+	// so they read as soft regions on the ground, not crisp circle markers like the other overlays.
+	function blobRing(lon, lat, radiusMeters, seed) {
+		const sides = 30;
+		const ring = new Array(sides + 1);
+		const dLatBase = radiusMeters / 111320;
+		const cosLat = Math.cos((lat * Math.PI) / 180) || 1e-6;
+		for (let i = 0; i < sides; i++) {
+			const a = (i / sides) * 2 * Math.PI;
+			// a few low harmonics (all integer multiples of a, so the ring closes smoothly) give an
+			// organic wobble; `seed` phase-shifts them so neighbouring hubs don't look identical.
+			const j = 0.82 + 0.2 * Math.sin(a * 2 + seed) + 0.12 * Math.sin(a * 3 - seed * 1.7) + 0.06 * Math.sin(a * 5 + seed * 2.3);
+			const rLat = dLatBase * j;
+			ring[i] = [lon + (rLat / cosLat) * Math.cos(a), lat + rLat * Math.sin(a)];
 		}
 		ring[sides] = ring[0];
 		return ring;
@@ -113,6 +153,7 @@
 	let gapFC = { type: "FeatureCollection", features: [] };
 	let conversionFC = { type: "FeatureCollection", features: [] };
 	let stationFC = { type: "FeatureCollection", features: [] };
+	let centerFC = { type: "FeatureCollection", features: [] };
 	let stats = null;
 
 	function emptyStats() {
@@ -140,7 +181,15 @@
 			topBuildTargets: [], // ranked build-here opportunities for the panel
 			perStation: [],
 			perRoute: [],
+			// greenfield first-line finder (works with zero stations)
+			cityCommuters: 0, // total home->work O-D volume
+			firstLines: [], // ranked demand corridors (zone A <-> zone B)
+			demandCenters: [], // top demand zones (residents + jobs)
 			demandAvailable: false,
+			// network length (from the game's track paths)
+			systemLengthM: 0, // unique station-to-station legs across all lines, one-way
+			trackBuiltM: 0, // every constructed track piece (parallels/sidings included)
+			trackPlannedM: 0, // blueprint track not yet built
 		};
 	}
 
@@ -158,6 +207,112 @@
 		const r = p.residentModeShare || {};
 		const w = p.workerModeShare || {};
 		return (r.walking || 0) + (w.walking || 0);
+	}
+
+	// ---- Network length (system km / per-line km) ----
+	// Tracks come from api.gameState.getTracks(): { id, coords: [[lon,lat],..], length (meters),
+	// buildType: "constructed" | "blueprint" }. Each line's path is rt.stCombos – one entry per
+	// station-to-station leg, { trackIds: [{ trackId, reversed }, ..], distance (meters) }.
+	// A leg is keyed by its two endpoint coords (order-independent) plus its rounded length, so
+	// the same physical leg counts ONCE even when a line runs it in both directions, several
+	// lines share it, or it sits on a parallel-track corridor – while genuinely different paths
+	// between the same two stations stay distinct.
+	function trackLengthM(t) {
+		if (!t) return 0;
+		if (Number.isFinite(t.length) && t.length > 0) return t.length;
+		const c = t.coords;
+		if (!Array.isArray(c) || c.length < 2) return 0;
+		let m = 0;
+		for (let i = 1; i < c.length; i++) {
+			const a = c[i - 1];
+			const b = c[i];
+			if (!a || !b) continue;
+			m += haversineMeters(a[0], a[1], b[0], b[1]);
+		}
+		return m;
+	}
+	function comboTrackEntries(combo) {
+		const list = combo && combo.trackIds;
+		if (!Array.isArray(list)) return [];
+		const out = [];
+		for (const it of list) {
+			if (it == null) continue;
+			if (typeof it === "object") {
+				if (it.trackId != null) out.push({ id: String(it.trackId), reversed: !!it.reversed });
+			} else {
+				out.push({ id: String(it), reversed: false });
+			}
+		}
+		return out;
+	}
+	function legInfo(combo, trackById) {
+		const entries = comboTrackEntries(combo);
+		let dist = combo && Number.isFinite(combo.distance) && combo.distance > 0 ? combo.distance : 0;
+		if (!dist) for (const e of entries) dist += trackLengthM(trackById.get(e.id));
+		if (!(dist > 0)) return null;
+		// Leg endpoints = first coord of the first track piece / last coord of the last one
+		// (respecting each piece's running direction) – i.e. the two station ends of the leg.
+		let key = null;
+		if (entries.length) {
+			const first = entries[0];
+			const last = entries[entries.length - 1];
+			const tA = trackById.get(first.id);
+			const tB = trackById.get(last.id);
+			const okA = tA && Array.isArray(tA.coords) && tA.coords.length > 1;
+			const okB = tB && Array.isArray(tB.coords) && tB.coords.length > 1;
+			const cA = okA ? (first.reversed ? tA.coords[tA.coords.length - 1] : tA.coords[0]) : null;
+			const cB = okB ? (last.reversed ? tB.coords[0] : tB.coords[tB.coords.length - 1]) : null;
+			if (cA && cB) {
+				const pt = (c) => c[0].toFixed(5) + "," + c[1].toFixed(5); // ~1 m grid
+				const a = pt(cA);
+				const b = pt(cB);
+				key = (a < b ? a + "|" + b : b + "|" + a) + "|" + Math.round(dist);
+			}
+		}
+		if (!key) {
+			// No resolvable geometry – key on the track-id set instead (still collapses the
+			// same leg run in both directions over the same tracks).
+			key =
+				entries
+					.map((e) => e.id)
+					.sort()
+					.join(",") +
+				"|" +
+				Math.round(dist);
+		}
+		return { key: key, dist: dist };
+	}
+	// Fills s.trackBuiltM / s.trackPlannedM / s.systemLengthM; returns Map(routeId -> meters).
+	function computeNetworkLength(routes, s) {
+		const perRouteLen = new Map();
+		let tracks = [];
+		try {
+			if (api.gameState && typeof api.gameState.getTracks === "function") tracks = api.gameState.getTracks() || [];
+		} catch (e) {
+			tracks = [];
+		}
+		const trackById = new Map();
+		for (const t of tracks) {
+			if (!t || t.id == null) continue;
+			trackById.set(String(t.id), t);
+			if (t.buildType === "constructed") s.trackBuiltM += trackLengthM(t);
+			else if (t.buildType === "blueprint") s.trackPlannedM += trackLengthM(t);
+		}
+		const sysLegs = new Map(); // leg key -> meters, across all real (non-temp) lines
+		for (const rt of routes) {
+			if (!rt || !Array.isArray(rt.stCombos) || !rt.stCombos.length) continue;
+			const legs = new Map();
+			for (const combo of rt.stCombos) {
+				const leg = legInfo(combo, trackById);
+				if (leg) legs.set(leg.key, leg.dist);
+			}
+			let m = 0;
+			for (const v of legs.values()) m += v;
+			if (m > 0) perRouteLen.set(rt.id, m);
+			if (!rt.tempParentId) for (const [k, v] of legs) sysLegs.set(k, v);
+		}
+		for (const v of sysLegs.values()) s.systemLengthM += v;
+		return perRouteLen;
 	}
 
 	// Resilience state: guard against the game firing a recompute while its station list is
@@ -345,10 +500,10 @@
 				convCand.push({ val: val, loc: pt.location, distM: nearestDist(pt.location) });
 			}
 			convCand.sort((a, b) => b.val - a.val);
-			const top = convCand.slice(0, 30);
+			const top = convCand.slice(0, 15);
 			const maxVal = top.length ? top[0].val : 1;
-			// 3 size tiers by share of the biggest market – a few big dots dominate, minor
-			// markets shrink to background = much less noise than a continuous gradient.
+			// 3 size tiers (in px) by share of the biggest market – a few big dots dominate, minor
+			// ones shrink to background = much less noise than a continuous gradient.
 			const tierRadius = (v) => {
 				const f = v / maxVal;
 				return f >= 0.55 ? 24 : f >= 0.22 ? 14 : 7;
@@ -408,6 +563,7 @@
 				rc.n++;
 			}
 		}
+		const routeLengths = computeNetworkLength(routes, s);
 		s.perRoute = routes
 			.map((rt) => {
 				const ra = routeAgg.get(rt.id) || { residents: 0, jobs: 0, drivers: 0, transit: 0 };
@@ -417,6 +573,7 @@
 					name: rt.name || rt.bullet || "Route",
 					bullet: rt.bullet || "",
 					color: rt.color || "#888",
+					lengthM: routeLengths.has(rt.id) ? routeLengths.get(rt.id) : null,
 					drivers: ra.drivers,
 					residents: ra.residents,
 					jobs: ra.jobs,
@@ -430,12 +587,123 @@
 		// biggest conversion opportunity first (most drivers within walking reach)
 		per.sort((a, b) => b.drivers - a.drivers);
 		s.perStation = per;
+		computeGreenfield(demand, s);
 		stats = s;
 
 		pushData();
 		try {
 			api.ui.forceUpdate();
 		} catch (e) {}
+	}
+
+	// First-line finder (greenfield). Independent of any station: bins demand points into ~1 km
+	// zones, sums each commuter group's home<->work O-D flow onto its zone pair, and ranks the
+	// busiest axes -- "where does my first line go?" Demand hubs (top zones by residents+jobs)
+	// draw as map dots (centerFC); the busiest axes are surfaced as the ranked "Start here" list
+	// (s.firstLines), NOT as map lines. Centers always resolve from the static point data; the
+	// axes need the pops' O-D volume (size), so they degrade gracefully to centers-only if O-D is
+	// absent. Writes centerFC + s.firstLines / s.demandCenters / s.cityCommuters the panel reads.
+	const GF_CELL_M = 1000; // ~1 km zoning
+	const GF_TOP_CORRIDORS = 10;
+	const GF_TOP_HOMES = 5; // biggest residential hubs (red)
+	const GF_TOP_JOBS = 5; // biggest job hubs (violet)
+	function popVolume(pop) {
+		if (pop && typeof pop.size === "number" && pop.size > 0) return pop.size;
+		const lc = pop && pop.lastCommute;
+		if (lc && lc.modeChoice) return (lc.modeChoice.driving || 0) + (lc.modeChoice.transit || 0) + (lc.modeChoice.walking || 0);
+		return 0;
+	}
+	function computeGreenfield(demand, s) {
+		centerFC = { type: "FeatureCollection", features: [] };
+		if (!demand || !demand.points || !demand.points.size) return;
+		// reference latitude for an equal-ish metric grid (lon scaled by cos(refLat))
+		let sumLat = 0, nLat = 0;
+		for (const p of demand.points.values()) {
+			if (p && p.location) { sumLat += p.location[1]; nLat++; }
+		}
+		if (!nLat) return;
+		const refLat = sumLat / nLat;
+		const mPerLat = 111320;
+		const mPerLon = 111320 * Math.cos((refLat * Math.PI) / 180) || 1e-6;
+		const zoneKey = (loc) => Math.floor((loc[0] * mPerLon) / GF_CELL_M) + "_" + Math.floor((loc[1] * mPerLat) / GF_CELL_M);
+		// 1. bin points -> zones (residents, jobs, demand-weighted centroid with a plain-average
+		//    fallback so an all-zero-demand zone can never produce a NaN centroid).
+		const zones = new Map();
+		const pointZone = new Map();
+		for (const [pid, p] of demand.points) {
+			if (!p || !p.location) continue;
+			const k = zoneKey(p.location);
+			let z = zones.get(k);
+			if (!z) { z = { key: k, res: 0, jobs: 0, wx: 0, wy: 0, w: 0, cx: 0, cy: 0, n: 0, lon: 0, lat: 0 }; zones.set(k, z); }
+			const res = p.residents || 0, jobs = p.jobs || 0, wt = res + jobs;
+			z.res += res; z.jobs += jobs;
+			z.wx += p.location[0] * wt; z.wy += p.location[1] * wt; z.w += wt;
+			z.cx += p.location[0]; z.cy += p.location[1]; z.n++;
+			pointZone.set(p.id != null ? p.id : pid, k);
+		}
+		for (const z of zones.values()) {
+			if (z.w > 0) { z.lon = z.wx / z.w; z.lat = z.wy / z.w; }
+			else { z.lon = z.cx / z.n; z.lat = z.cy / z.n; }
+		}
+		// 2. aggregate O-D flows between DISTINCT zones (intra-zone = walk distance, not a line)
+		const flows = new Map();
+		let totalVol = 0;
+		if (demand.popsMap && demand.popsMap.size) {
+			for (const pop of demand.popsMap.values()) {
+				if (!pop) continue;
+				const hk = pointZone.get(pop.residenceId);
+				const jk = pointZone.get(pop.jobId);
+				if (hk == null || jk == null) continue;
+				const vol = popVolume(pop);
+				if (!(vol > 0)) continue;
+				totalVol += vol;
+				if (hk === jk) continue;
+				const key = hk < jk ? hk + "|" + jk : jk + "|" + hk;
+				let f = flows.get(key);
+				if (!f) { f = { aKey: hk < jk ? hk : jk, bKey: hk < jk ? jk : hk, flow: 0 }; flows.set(key, f); }
+				f.flow += vol;
+			}
+		}
+		s.cityCommuters = Math.round(totalVol);
+		// 3. rank corridors -> the panel "Start here" list (busiest home<->work axes; no map line,
+		//    just the ranked pairing of demand centers + distance, with click-to-center)
+		const cor = Array.from(flows.values()).sort((a, b) => b.flow - a.flow).slice(0, GF_TOP_CORRIDORS);
+		const firstLines = [];
+		cor.forEach((f, i) => {
+			const za = zones.get(f.aKey), zb = zones.get(f.bKey);
+			if (!za || !zb) return;
+			const distM = haversineMeters(za.lon, za.lat, zb.lon, zb.lat);
+			firstLines.push({ rank: i + 1, flow: Math.round(f.flow), distM: distM, from: [za.lon, za.lat], to: [zb.lon, zb.lat], mid: [(za.lon + zb.lon) / 2, (za.lat + zb.lat) / 2] });
+		});
+		s.firstLines = firstLines;
+		// 4. demand hubs = top RESIDENTIAL zones (red) + top JOB zones (violet), each ranked within
+		//    its own kind. Splitting is essential: jobs concentrate into a few dense zones while
+		//    homes spread out, so a single "by total" ranking is ALL job zones -- leaving nothing
+		//    residential to connect a line to. Homes take ranks 1..H, jobs continue H+1..H+J; each group is
+		//    sized within itself so both have a visible big-to-small range.
+		const allZones = Array.from(zones.values()).filter((z) => z.res + z.jobs > 0);
+		const homeZones = allZones.filter((z) => z.res >= z.jobs).sort((a, b) => b.res - a.res).slice(0, GF_TOP_HOMES);
+		const jobZones = allZones.filter((z) => z.jobs > z.res).sort((a, b) => b.jobs - a.jobs).slice(0, GF_TOP_JOBS);
+		const maxHomeRes = homeZones.length ? homeZones[0].res : 1;
+		const maxJobJobs = jobZones.length ? jobZones[0].jobs : 1;
+		const cenFeatures = [], demandCenters = [];
+		const addHub = (z, kind, rank) => {
+			const metric = kind === "home" ? z.res : z.jobs;
+			const denom = kind === "home" ? maxHomeRes : maxJobJobs;
+			// blob radius in METRES (scales with the map = aerial), sized within the hub's own group
+			const rm = 420 + 1080 * Math.sqrt(denom > 0 ? metric / denom : 0);
+			const seed = ((Math.abs(z.lon) * 53.13 + Math.abs(z.lat) * 131.7) % (Math.PI * 2)) + rank * 0.6;
+			cenFeatures.push({
+				type: "Feature",
+				properties: { rank: rank, label: String(rank), kind: kind, residents: z.res, jobs: z.jobs },
+				geometry: { type: "Polygon", coordinates: [blobRing(z.lon, z.lat, rm, seed)] },
+			});
+			demandCenters.push({ rank: rank, kind: kind, residents: z.res, jobs: z.jobs, total: z.res + z.jobs, coords: [z.lon, z.lat] });
+		};
+		homeZones.forEach((z, i) => addHub(z, "home", i + 1));
+		jobZones.forEach((z, i) => addHub(z, "job", homeZones.length + i + 1));
+		centerFC = { type: "FeatureCollection", features: cenFeatures };
+		s.demandCenters = demandCenters;
 	}
 
 	// ---------------------------------------------------------------------------
@@ -448,6 +716,7 @@
 	let showGaps = false;
 	let showConversion = true;
 	let showStations = false;
+	let showFirstLines = true; // greenfield first-line corridors + demand centers (pre-stations)
 	let showSatellite = true;
 	let satOpacity = 1;
 	let proxyStatus = "unknown"; // "unknown" | "up" | "down" – satellite tile proxy reachability
@@ -462,6 +731,66 @@
 	let effSaveKey = null; // save we've loaded efficiency data for (persistence is per-save)
 	const EFF_KEY_PREFIX = "cpro_eff_";
 	const expandedLines = new Set(); // routeIds expanded to show their per-station breakdown
+
+	// Game-speed control (Setup tab). Uses the game's own api.actions; no third-party mod code.
+	const SPEED_MAX_TURBO = 8; // push the game's 'ultrafast' tier to its practical maximum
+	let speedSkipTarget = null; // in-game day the max-speed run pauses at, at midnight (null = idle)
+	function gameSpeed(tier) {
+		try {
+			api.actions.setSpeed(tier);
+		} catch (e) {}
+	}
+	function gamePause(p) {
+		try {
+			api.actions.setPause(p);
+		} catch (e) {}
+	}
+	function gameTurbo(m) {
+		try {
+			api.actions.setSpeedMultiplier("ultrafast", m);
+		} catch (e) {}
+	}
+	function speedStartSkip() {
+		let d = null;
+		try {
+			d = api.gameState.getCurrentDay();
+		} catch (e) {}
+		if (d == null) return;
+		speedSkipTarget = d + 1; // the next midnight
+		gameTurbo(SPEED_MAX_TURBO);
+		gameSpeed("ultrafast");
+		gamePause(false);
+		try {
+			api.ui.forceUpdate();
+		} catch (e) {}
+	}
+	function speedCancelSkip() {
+		speedSkipTarget = null;
+		gameTurbo(1);
+		gamePause(true);
+		gameSpeed("normal");
+		try {
+			api.ui.forceUpdate();
+		} catch (e) {}
+	}
+	// Runs on each in-game day rollover (and a polling backstop). Pauses EXACTLY at midnight when an
+	// active skip reaches its target day, then drops back to normal speed for the next unpause.
+	function speedCheckSkip() {
+		if (speedSkipTarget == null) return;
+		let d = null;
+		try {
+			d = api.gameState.getCurrentDay();
+		} catch (e) {}
+		if (d == null || d >= speedSkipTarget) {
+			speedSkipTarget = null;
+			gameTurbo(1);
+			gamePause(true);
+			gameSpeed("normal");
+			try {
+				api.ui.forceUpdate();
+			} catch (e) {}
+		}
+	}
 	function sampleEfficiency() {
 		let lm, trains;
 		try {
@@ -578,7 +907,7 @@
 				window.localStorage.setItem(EFF_KEY_PREFIX + saveName, JSON.stringify(obj));
 			}
 		} catch (e) {}
-		// keep the Efficiency tab live as peaks accumulate (it doesn't re-render on its own)
+		// keep the Efficiency tab live as data accumulates (it doesn't re-render on its own)
 		if (activeTab === "efficiency") {
 			try {
 				api.ui.forceUpdate();
@@ -638,6 +967,7 @@
 					showGaps,
 					showConversion,
 					showStations,
+					showFirstLines,
 					showSatellite,
 					showBuildings,
 					satOpacity,
@@ -684,6 +1014,7 @@
 				if (typeof p.showGaps === "boolean") showGaps = p.showGaps;
 				if (typeof p.showConversion === "boolean") showConversion = p.showConversion;
 				if (typeof p.showStations === "boolean") showStations = p.showStations;
+				if (typeof p.showFirstLines === "boolean") showFirstLines = p.showFirstLines;
 				if (typeof p.showSatellite === "boolean") showSatellite = p.showSatellite;
 				if (typeof p.showBuildings === "boolean") showBuildings = p.showBuildings;
 				if (typeof p.satOpacity === "number") satOpacity = p.satOpacity;
@@ -819,10 +1150,10 @@
 			api.map.registerSource(SRC_CONV, { type: "geojson", data: conversionFC });
 		}
 		if (!map.getLayer(LYR_CONV)) {
-			// latent-demand markets – uncovered would-be-rider pockets.
-			// SIZE (3 tiers) = community potential; COLOR = cost (distance to network):
-			// green = near/cheap (build now) → amber → red = far/expensive (grow toward).
-			// Small (minor) markets are also faded so the big ones dominate = less noise.
+			// latent-demand markets – uncovered would-be-rider pockets, drawn as vivid circles with
+			// NO border (the actionable foreground layer, distinct from the white-ringed station
+			// dots). SIZE (3 tiers) = community potential; COLOR = cost (distance to network):
+			// green = near/cheap (build now) → amber → magenta = far/expensive (grow toward).
 			convDef = {
 				id: LYR_CONV,
 				type: "circle",
@@ -839,12 +1170,9 @@
 						4500,
 						"#ffc83d",
 						9000,
-						"#e0563c",
+						"#c2298a",
 					],
-					"circle-opacity": ["interpolate", ["linear"], ["get", "r"], 7, 0.5, 24, 0.82],
-					"circle-stroke-color": "#ffffff",
-					"circle-stroke-width": 1.2,
-					"circle-stroke-opacity": 0.85,
+					"circle-opacity": ["interpolate", ["linear"], ["get", "r"], 7, 0.6, 24, 0.88],
 				},
 			};
 			api.map.registerLayer(convDef);
@@ -904,6 +1232,55 @@
 			};
 			api.map.registerLayer(stnLabelDef);
 		}
+		// Demand hubs – faint, organic AREA fills (red = residential, violet = job), drawn as soft
+		// aerial regions in the background so they read apart from the crisp circle markers and
+		// don't bombard the map mid-game. Sized within each kind; numbered to match the list.
+		if (!map.getSource(SRC_CEN)) {
+			api.map.registerSource(SRC_CEN, { type: "geojson", data: centerFC });
+		}
+		if (!map.getLayer(LYR_CEN)) {
+			cenDef = {
+				id: LYR_CEN,
+				type: "fill",
+				source: SRC_CEN,
+				layout: { visibility: showFirstLines ? "visible" : "none" },
+				paint: {
+					"fill-color": ["match", ["get", "kind"], "home", HUB_HOME, "job", HUB_JOB, "#b388ff"],
+					"fill-opacity": 0.22,
+					// soft same-hue edge (NOT a hard white ring) just to make the irregular shape legible
+					"fill-outline-color": ["match", ["get", "kind"], "home", "rgba(192,57,43,0.55)", "job", "rgba(131,102,240,0.55)", "rgba(179,136,255,0.5)"],
+				},
+			};
+			// place BELOW the latent-demand / station markers so the regions sit behind the crisp dots
+			try {
+				api.map.registerLayer(cenDef, LYR_CONV);
+			} catch (e) {
+				api.map.registerLayer(cenDef);
+			}
+		}
+		// Rank number (1..N) at each demand-hub region's centre, tying the map to the list order.
+		if (!map.getLayer(LYR_CEN_LABEL)) {
+			cenLabelDef = {
+				id: LYR_CEN_LABEL,
+				type: "symbol",
+				source: SRC_CEN,
+				layout: {
+					"text-field": ["get", "label"],
+					"text-font": mapTextFont(map),
+					"text-size": 11,
+					"text-allow-overlap": true,
+					"text-ignore-placement": true,
+					visibility: showFirstLines ? "visible" : "none",
+				},
+				paint: {
+					"text-color": "#ffffff",
+					"text-opacity": 0.9,
+					"text-halo-color": "rgba(0,0,0,0.8)",
+					"text-halo-width": 1.4,
+				},
+			};
+			api.map.registerLayer(cenLabelDef);
+		}
 	}
 
 	function pushData() {
@@ -913,6 +1290,7 @@
 		if (map.getSource(SRC_CATCH)) map.getSource(SRC_CATCH).setData(catchmentFC);
 		if (map.getSource(SRC_CONV)) map.getSource(SRC_CONV).setData(conversionFC);
 		if (map.getSource(SRC_STN)) map.getSource(SRC_STN).setData(stationFC);
+		if (map.getSource(SRC_CEN)) map.getSource(SRC_CEN).setData(centerFC);
 		applyVisibility(map);
 	}
 
@@ -951,6 +1329,8 @@
 		vis(LYR_CONV, showConversion);
 		vis(LYR_STN, showStations);
 		vis(LYR_STN_LABEL, showStations);
+		vis(LYR_CEN, showFirstLines);
+		vis(LYR_CEN_LABEL, showFirstLines);
 	}
 
 
@@ -1009,13 +1389,19 @@
 		compute();
 		loadPrefs();
 	});
-	api.hooks.onStationBuilt(() => compute());
+	api.hooks.onStationBuilt(() => {
+		compute();
+	});
 	api.hooks.onStationDeleted(() => {
 		deletionSignaled = true; // a real removal – allow the station count to shrink
 		compute();
 	});
-	api.hooks.onTrackChange(() => compute());
-	api.hooks.onBlueprintPlaced(() => compute());
+	api.hooks.onTrackChange(() => {
+		compute();
+	});
+	api.hooks.onBlueprintPlaced(() => {
+		compute();
+	});
 	if (api.hooks.onDemandChange) api.hooks.onDemandChange(() => compute());
 
 	function pct(n, d) {
@@ -1024,6 +1410,12 @@
 	}
 	function fmt(n) {
 		return Math.round(n || 0).toLocaleString();
+	}
+	function fmtLen(m) {
+		if (!Number.isFinite(m) || m <= 0) return "–";
+		if (m < 950) return Math.round(m) + " m";
+		const km = m / 1000;
+		return (km >= 100 ? Math.round(km).toLocaleString() : km.toFixed(1)) + " km";
 	}
 	// success rate color – MUST match the LYR_STN circle's interpolate stops exactly
 	// (0 → red, 0.05 → amber, 0.2 → green), so the panel's capture dots match the map dots.
@@ -1082,10 +1474,10 @@
 		);
 	}
 
-	// ---- small presentational helpers (AA-style cards) ----
+	// ---- small presentational helpers (cards) ----
 
-	function sectionHead(t) {
-		return h(
+	function sectionHead(t, infoKey) {
+		const head = h(
 			"div",
 			{
 				style: {
@@ -1096,8 +1488,10 @@
 					margin: "14px 0 6px",
 				},
 			},
-			t
+			t,
+			infoKey ? infoIcon(infoKey) : null
 		);
+		return infoKey ? [head, infoBox(infoKey)] : head;
 	}
 
 	function card(children, accent) {
@@ -1116,7 +1510,7 @@
 		);
 	}
 
-	function kpiCard(label, value, sub, color) {
+	function kpiCard(label, value, sub, color, infoKey) {
 		return h(
 			"div",
 			{
@@ -1131,252 +1525,198 @@
 			},
 			h(
 				"div",
-				{ style: { fontSize: "9.5px", textTransform: "uppercase", letterSpacing: "0.04em", opacity: 0.5 } },
-				label
+				{ style: { fontSize: "9.5px", textTransform: "uppercase", letterSpacing: "0.04em", opacity: 0.5, display: "flex", alignItems: "center" } },
+				label,
+				infoKey ? infoIcon(infoKey) : null
 			),
 			h(
 				"div",
 				{ style: { fontSize: "21px", fontWeight: 700, marginTop: "1px", color: color || "inherit", lineHeight: 1.1 } },
 				value
 			),
-			sub ? h("div", { style: { fontSize: "10px", opacity: 0.55, marginTop: "1px" } }, sub) : null
+			sub ? h("div", { style: { fontSize: "10px", opacity: 0.55, marginTop: "1px" } }, sub) : null,
+			infoKey ? infoBox(infoKey) : null
 		);
 	}
 
-	const toggleBtn = (label, on, dot, onClick) =>
+	// ---- Inline "i" explanations: every concept is explained where it appears (no glossary
+	// page). One explanation open at a time; texts live in INFO so they stay in one place. ----
+	let openInfo = null; // key of the explanation currently expanded (not persisted)
+	const INFO = {
+		catchment: "Each station's walk catchment circle – about a 30-minute / ~1.8 km walk. The area people can reach on foot to or from the station.",
+		hubs: "For a fresh map with no stations: your biggest RESIDENTIAL hubs (red, ranks 1–5) and biggest JOB hubs (violet, ranks 6–10) – numbered areas, sized within each group. Shown separately on purpose: jobs cluster into a few dense spots while homes spread out, so the two need their own rankings. The Planning tab lists the same hubs; a good first line connects a big red hub to a big violet one.",
+		latent: "Would-be riders: people who drive today and whose OTHER trip end is already on your network – one extension wins them. SIZE (3 tiers) = community potential (number of would-be riders). COLOR = cost = distance to your nearest station: green = near/cheap (build now) → amber → magenta = far/expensive (a corridor to grow toward). Exact numbers are in the Build here next list.",
+		stations: "A dot at each station showing its SUCCESS RATE. The % (and the dot color, red → amber → green) = of the motorized commuters within walking reach, the share who take transit instead of driving. Low % (red) = lots of nearby drivers not yet won to transit. Dot size is just your visual preference (the Display slider).",
+		satellite: "Real photographic imagery as the base map. Pick a source under Base imagery – Esri (default), Google, Hybrid (satellite + labels), or OSM. All free, no key, no setup.",
+		buildings: "The game's own 3D buildings. Turn off for a clean satellite view.",
+		greenfieldKpis: "Before you build, the headline numbers are city totals – Residents, Jobs, and Commuters (daily home→work trips). Busiest link is the single biggest home→work flow: your strongest first-line opportunity. These switch to coverage numbers once you build your first station.",
+		resCovered: "Share of the whole city within walking reach of ANY station (counted once, no double counting).",
+		capture: "Of commuters whose home AND work are both reachable by your network, the share who already take transit instead of driving.",
+		modeShift: "Drivers whose home AND work are BOTH already within a catchment – winnable on TODAY's network (no building needed), because transit only beats driving when the whole door-to-door trip works. They drive anyway = your service-quality opportunity.",
+		gaps: "Uncovered demand – residents and jobs with no station in walking range. A panel number, not a map layer.",
+		network: "System length = the one-way length of every station-to-station leg your lines serve, measured along the actual track path – each leg counts once even when lines share it, run both directions, or use parallel tracks. Track built = ALL constructed track on the map (parallel tracks, sidings, crossovers and unused track all add up, so it's usually longer than the system). Per-line lengths are in the route table below.",
+		captured: "Residents and jobs with at least one station in walking reach. Double-covered = inside 2+ catchments (overlap – useful for transfers, wasteful for pure coverage).",
+		modeShiftCard: "Mode-shift potential = drivers whose home AND work are both within a catchment – winnable on today's network. Home end / Work end only = served at just ONE end; they need a stop at the other end before they can switch to transit.",
+		buildNext: "The ranked latent-demand shortlist (matching the map dots): each is the would-be riders at an uncovered market – people whose OTHER trip end is already on your network – plus the distance to your nearest station (the track you'd lay). Ranked by community size. Click a row to fly there.",
+		tablesRoute: "Length = the line's one-way route length, measured along its actual track path (branches count once). Rate = transit ÷ (transit + drivers) within reach – the colored dot matches the map. Riders / Drivers = daily transit users / drivers with this end in walking reach. Click a row to fly there. Reach is straight-line walk potential – planning estimates, not the sim's exact numbers.",
+		tablesStation: "Rate = transit ÷ (transit + drivers) within reach – the colored dot matches the map. Riders / Drivers = daily transit users / drivers with this end in walking reach. Click a row to fly there. Reach is straight-line walk potential – planning estimates, not the sim's exact numbers.",
+	};
+	const infoIcon = (key) =>
 		h(
 			"button",
 			{
 				onClick: () => {
-					onClick();
-					applyVisibility(api.utils.getMap());
-					savePrefs();
+					openInfo = openInfo === key ? null : key;
 					try {
 						api.ui.forceUpdate();
 					} catch (e) {}
 				},
+				title: openInfo === key ? "Hide explanation" : "What is this?",
 				style: {
-					flex: 1,
-					padding: "5px 8px",
+					display: "inline-flex",
+					alignItems: "center",
+					justifyContent: "center",
+					width: "13px",
+					height: "13px",
+					padding: 0,
+					marginLeft: "5px",
+					borderRadius: "50%",
+					border: "1px solid " + (openInfo === key ? "rgba(90,169,230,0.9)" : "rgba(128,128,128,0.55)"),
+					background: openInfo === key ? "rgba(90,169,230,0.25)" : "transparent",
+					color: "inherit",
+					opacity: openInfo === key ? 1 : 0.55,
+					fontSize: "9px",
+					fontWeight: 700,
+					fontStyle: "italic",
+					lineHeight: 1,
 					cursor: "pointer",
-					borderRadius: "3px",
-					border: "1px solid rgba(128,128,128,0.4)",
-					background: on ? "rgba(255,255,255,0.10)" : "transparent",
-					opacity: on ? 1 : 0.5,
-					fontWeight: 600,
-					fontSize: "12px",
+					verticalAlign: "middle",
+					flexShrink: 0,
 				},
 			},
-			h("span", { style: { color: dot } }, on ? "● " : "○ "),
-			label
+			"i"
+		);
+	// inset=true renders full-bleed inside a settings card (attached under its row); default is a
+	// small standalone note (KPI cards, section heads).
+	const infoBox = (key, inset) =>
+		openInfo === key
+			? h(
+					"div",
+					{
+						style: {
+							fontSize: "10.5px",
+							lineHeight: 1.55,
+							opacity: 0.85,
+							background: "rgba(90,169,230,0.07)",
+							borderLeft: "2px solid rgba(90,169,230,0.5)",
+							padding: inset ? "7px 14px 7px 12px" : "6px 9px",
+							margin: inset ? 0 : "5px 0 3px",
+							borderTop: inset ? "1px solid rgba(128,128,128,0.14)" : "none",
+							borderRadius: inset ? 0 : "0 4px 4px 0",
+						},
+					},
+					INFO[key]
+			  )
+			: null;
+
+	// ---- Setup-page building blocks: bordered cards (header + caption) holding hairline-divided
+	// settings rows - label + description on the left, the control on the right. ----
+	const switchCtl = (on, onClick) =>
+		h(
+			"button",
+			{
+				onClick: onClick,
+				role: "switch",
+				"aria-checked": on,
+				style: {
+					width: "34px",
+					height: "20px",
+					flexShrink: 0,
+					borderRadius: "10px",
+					border: "1px solid " + (on ? "rgba(90,169,230,0.9)" : "rgba(128,128,128,0.5)"),
+					background: on ? "rgba(90,169,230,0.85)" : "rgba(128,128,128,0.25)",
+					cursor: "pointer",
+					padding: "1px",
+					display: "inline-flex",
+					alignItems: "center",
+					transition: "background 0.15s ease, border-color 0.15s ease",
+				},
+			},
+			h("span", {
+				style: {
+					width: "16px",
+					height: "16px",
+					borderRadius: "50%",
+					background: "#ffffff",
+					display: "block",
+					marginLeft: on ? "14px" : "1px",
+					transition: "margin-left 0.15s ease",
+					boxShadow: "0 1px 2px rgba(0,0,0,0.45)",
+				},
+			})
+		);
+	const setupRow = (label, desc, control, dot) =>
+		h(
+			"div",
+			{ style: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: "14px", padding: "9px 14px", borderTop: "1px solid rgba(128,128,128,0.14)" } },
+			h(
+				"div",
+				{ style: { minWidth: 0 } },
+				h(
+					"div",
+					{ style: { fontSize: "12px", fontWeight: 600 } },
+					dot ? h("span", { style: { display: "inline-block", width: "8px", height: "8px", borderRadius: "50%", background: dot, marginRight: "7px", verticalAlign: "middle", border: dot === "#ffffff" ? "1px solid rgba(128,128,128,0.5)" : "none" } }) : null,
+					label
+				),
+				desc ? h("div", { style: { fontSize: "10px", opacity: 0.55, marginTop: "2px", lineHeight: 1.45 } }, desc) : null
+			),
+			h("div", { style: { flexShrink: 0, display: "flex", alignItems: "center" } }, control)
+		);
+	const setupCard = (title, caption, children, headerRight) =>
+		h(
+			"div",
+			{ style: { border: "1px solid rgba(128,128,128,0.25)", borderRadius: "8px", background: "rgba(255,255,255,0.035)", marginBottom: "14px", overflow: "hidden" } },
+			h(
+				"div",
+				{ style: { display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: "10px", padding: "12px 14px 10px" } },
+				h(
+					"div",
+					null,
+					h("div", { style: { fontSize: "12.5px", fontWeight: 700 } }, title),
+					caption ? h("div", { style: { fontSize: "10.5px", opacity: 0.55, marginTop: "2px", lineHeight: 1.45 } }, caption) : null
+				),
+				headerRight || null
+			),
+			...(children || [])
 		);
 
 	function renderPanel() {
 		const s = stats;
 
-		const toggles = h(
-			"div",
-			{ style: { display: "flex", flexWrap: "wrap", gap: "6px" } },
-			toggleBtn("Catchment", showCircles, "#9aa5b0", () => {
-				showCircles = !showCircles;
-			}),
-			toggleBtn("Latent demand", showConversion, CONV_COLOR, () => {
-				showConversion = !showConversion;
-			}),
-			toggleBtn("Stations", showStations, "#ffffff", () => {
-				showStations = !showStations;
-			}),
-			toggleBtn("Satellite", showSatellite, "#5aa9e6", () => {
-				showSatellite = !showSatellite;
-				if (showSatellite) checkProxyHealth();
-			}),
-			toggleBtn("Buildings", showBuildings, "#bdbdbd", () => {
-				showBuildings = !showBuildings;
-			})
-		);
-
-		const opacityRow = h(
-			"div",
-			{ style: { display: "flex", alignItems: "center", gap: "8px" } },
-			h("span", { style: { fontSize: "11px", opacity: 0.7, whiteSpace: "nowrap", width: "92px" } }, "Satellite opacity"),
-			h("input", {
-				type: "range",
-				min: 0,
-				max: 1,
-				step: 0.05,
-				value: satOpacity,
-				style: { flex: 1 },
-				onChange: (e) => {
-					satOpacity = parseFloat(e.target.value);
-					applyVisibility(api.utils.getMap());
-					savePrefs();
-					try {
-						api.ui.forceUpdate();
-					} catch (e2) {}
-				},
-			}),
-			h("span", { style: { fontSize: "11px", width: "32px", textAlign: "right" } }, Math.round(satOpacity * 100) + "%")
-		);
-
-		const provPill = (p) =>
-			h(
-				"button",
-				{
-					key: p.id,
-					onClick: () => setSatProvider(p.id),
-					title: p.label + " – no key needed",
-					style: {
-						flex: "1 1 auto",
-						padding: "4px 8px",
-						cursor: "pointer",
-						borderRadius: "3px",
-						border: "1px solid rgba(128,128,128,0.4)",
-						background: satProvider === p.id ? "rgba(90,169,230,0.22)" : "transparent",
-						opacity: satProvider === p.id ? 1 : 0.6,
-						fontSize: "11px",
-						fontWeight: 600,
-					},
-				},
-				p.label
-			);
-		const providerRow = h(
-			"div",
-			{ style: { display: "flex", alignItems: "center", gap: "6px", marginBottom: "6px" } },
-			h("span", { style: { fontSize: "11px", opacity: 0.7, whiteSpace: "nowrap", width: "62px" } }, "Imagery"),
-			h("div", { style: { display: "flex", flexWrap: "wrap", gap: "5px", flex: 1 } }, SAT_PROVIDERS.map(provPill))
-		);
-
-		const proxyRow =
-			proxyStatus === "up"
-				? h("div", { style: { marginTop: "7px", fontSize: "11px", color: "#39c35a" } }, "✓ Tile proxy connected")
-				: proxyStatus === "down"
-				? h(
-						"div",
-						{ style: { marginTop: "7px", fontSize: "11px", color: "#ffae57", lineHeight: 1.5 } },
-						"⚠ Satellite needs the local tile proxy (not running). One-time setup: run ",
-						h("code", { style: { background: "rgba(255,255,255,0.1)", padding: "0 4px", borderRadius: "3px" } }, "install-proxy.sh"),
-						" in the mod folder (see README). ",
-						h(
-							"button",
-							{ onClick: copyProxyCmd, style: { marginLeft: "4px", padding: "2px 8px", cursor: "pointer", borderRadius: "3px", border: "1px solid rgba(128,128,128,0.4)", background: "transparent", color: "inherit", fontSize: "10px" } },
-							"Copy command"
-						)
-				  )
-				: h("div", { style: { marginTop: "7px", fontSize: "11px", opacity: 0.5 } }, "Checking proxy…");
-		const satControls = h(
-			"div",
-			{ style: { marginTop: "8px", opacity: showSatellite ? 1 : 0.5 } },
-			providerRow,
-			opacityRow,
-			proxyRow
-		);
-
-		// Station dot size – scales our overlay station dots and their % labels.
-		const dotScaleRow = h(
-			"div",
-			{ style: { display: "flex", alignItems: "center", gap: "8px", marginTop: "8px" } },
-			h("span", { style: { fontSize: "11px", opacity: 0.7, whiteSpace: "nowrap", width: "92px" } }, "Station dot size"),
-			h("input", {
-				type: "range",
-				min: 0.5,
-				max: 2.5,
-				step: 0.1,
-				value: stationDotScale,
-				style: { flex: 1 },
-				onChange: (e) => {
-					stationDotScale = parseFloat(e.target.value);
-					applyDotScale();
-					savePrefs();
-					try {
-						api.ui.forceUpdate();
-					} catch (e2) {}
-				},
-			}),
-			h("span", { style: { fontSize: "11px", width: "36px", textAlign: "right" } }, stationDotScale.toFixed(1) + "x")
-		);
-
-		// ---- Concepts / help popover ----
-		const infoHead = (t) =>
-			h(
-				"div",
-				{ style: { fontSize: "10px", textTransform: "uppercase", letterSpacing: "0.05em", opacity: 0.5, margin: "12px 0 5px" } },
-				t
-			);
-		const infoRow = (term, desc, dot) =>
-			h(
-				"div",
-				{ style: { marginBottom: "8px" } },
-				h(
-					"div",
-					{ style: { fontWeight: 700, fontSize: "11.5px", marginBottom: "1px" } },
-					dot
-						? h("span", {
-								style: {
-									display: "inline-block",
-									width: "8px",
-									height: "8px",
-									borderRadius: "50%",
-									background: dot,
-									marginRight: "5px",
-									verticalAlign: "middle",
-								},
-						  })
-						: null,
-					term
-				),
-				h("div", { style: { fontSize: "10.5px", opacity: 0.7, lineHeight: 1.45 } }, desc)
-			);
-		const glossaryContent = h(
-			"div",
-			null,
-					infoHead("Map overlays (the toggles)"),
-					infoRow("Catchment", "Each station's walk catchment circle – about a 30-minute / ~1.8 km walk. The area people can reach on foot to or from the station.", "#9aa5b0"),
-					infoRow(
-						"Latent demand",
-						"Would-be riders: people who drive today and whose OTHER trip end is already on your network – one extension wins them. SIZE (3 tiers) = community potential (number of would-be riders). COLOR = cost = distance to your nearest station: green = near/cheap (build now) → amber → red = far/expensive (a corridor to grow toward). So big green = do it now; big red = your directional goal; small dots = minor markets. Exact numbers are in the Build here next list – click a row to fly there.",
-						CONV_COLOR
-					),
-					infoRow(
-						"Stations",
-						"A dot at each station showing its SUCCESS RATE. The % (and the dot color, red → amber → green) = of the motorized commuters within walking reach, the share who take transit instead of driving. Low % (red) = lots of nearby drivers not yet won to transit; high % (green) = high transit share. Dot size is just your visual preference (the “Station dot size” slider)."
-					),
-					infoRow("Satellite", "Real photographic imagery as the base map. Pick a source from the Imagery buttons – Esri (default), Google, Hybrid (satellite + labels), or OSM. All free, no key, no setup.", "#5aa9e6"),
-					infoRow("Buildings", "Show/hide the game's own 3D buildings. Turn off for a clean satellite view."),
-
-					infoHead("Headline numbers"),
-					infoRow("Residents / Jobs covered", "Share of the whole city within walking reach of ANY station (counted once)."),
-					infoRow("Capture rate", "Of commuters whose home AND work are both reachable by your network, the share who already take transit instead of driving."),
-					infoRow("Mode shift", "Drivers whose home AND work are BOTH already within a catchment – winnable on TODAY's network (no building needed), because transit only beats driving when the whole door-to-door trip works. They drive anyway = your service-quality opportunity."),
-					infoRow("Home-end / Work-end only", "Drivers served at just one end of their commute. They need a stop at the OTHER end before they can switch to transit."),
-					infoRow("Gap hotspots", "A panel number (not a map layer): uncovered demand – residents and jobs with no station in walking range."),
-					infoRow(
-						"Build here next",
-						"The ranked latent-demand shortlist (matching the map dots): each is the would-be riders at an uncovered market – people whose OTHER trip end is already on your network – plus the distance to your nearest station (the track you'd lay). Ranked by community size. Click a row to fly there."
-					),
-
-					infoHead("Per-route / per-station tables"),
-					infoRow("Rate", "Success rate = transit ÷ (transit + drivers) within reach. The colored dot matches the map dots."),
-					infoRow("Riders", "Transit users with this end (home or work) in walking reach – a daily figure."),
-					infoRow("Drivers", "Drivers likewise – your conversion opportunity at that station/route."),
-					infoRow("Click a row", "Flies the map straight to that station or route."),
-
-					infoHead("Good to know"),
-					infoRow("Daily & time-stable", "All figures are daily – they don't drop to zero at night, so the view is consistent whenever you check."),
-					infoRow("Potential, not the sim", "“Reach” is straight-line walk potential; the game's exact assignment uses full pathfinding. Treat these as planning estimates, not the sim's precise numbers.")
-		);
 
 		// ---- Planning tab content (needs stats) ----
 		let planningContent;
 		if (s) {
-		// Header KPI tiles (fixed, always visible)
-		const kpis = h(
-			"div",
-			{ style: { display: "flex", flexWrap: "wrap", gap: "6px", marginTop: "10px" } },
-			kpiCard("Residents covered", pct(s.coveredResidents, s.cityResidents), pct(s.coveredJobs, s.cityJobs) + " of jobs"),
-			kpiCard("Capture rate", pct(s.bothEndsTransit, s.bothEndsTransit + s.convertibleDrivers), "both ends served", CONV_COLOR),
-			kpiCard("Mode shift", fmt(s.convertibleDrivers), "drivers, both ends served", CONV_COLOR),
-			kpiCard("Gap hotspots", fmt(s.gapCount), fmt(s.gapResidents + s.gapJobs) + " unserved", GAP_COLOR)
-		);
+		// Header KPI tiles. On a fresh map (no stations) coverage/mode-shift are all zero and
+		// useless, so swap in greenfield demand totals until the first station exists.
+		const kpis =
+			s.stationCount === 0
+				? h(
+						"div",
+						{ style: { display: "flex", flexWrap: "wrap", gap: "6px", marginTop: "10px" } },
+						kpiCard("Residents", fmt(s.cityResidents), "city total"),
+						kpiCard("Jobs", fmt(s.cityJobs), "city total"),
+						kpiCard("Commuters", fmt(s.cityCommuters), "daily commuter trips"),
+						kpiCard("Busiest link", s.firstLines.length ? fmt(s.firstLines[0].flow) : "–", s.firstLines.length ? "commuters, top pair" : "no O-D data yet", HUB_ACCENT, "greenfieldKpis")
+				  )
+				: h(
+						"div",
+						{ style: { display: "flex", flexWrap: "wrap", gap: "6px", marginTop: "10px" } },
+						kpiCard("Residents covered", pct(s.coveredResidents, s.cityResidents), pct(s.coveredJobs, s.cityJobs) + " of jobs", null, "resCovered"),
+						kpiCard("Capture rate", pct(s.bothEndsTransit, s.bothEndsTransit + s.convertibleDrivers), "both ends served", CONV_COLOR, "capture"),
+						kpiCard("Mode shift", fmt(s.convertibleDrivers), "drivers, both ends served", CONV_COLOR, "modeShift"),
+						kpiCard("Gap hotspots", fmt(s.gapCount), fmt(s.gapResidents + s.gapJobs) + " unserved", GAP_COLOR, "gaps")
+				  );
 
 		// Station table – all stations; the body scrolls so it never overflows.
 		const rows = s.perStation.map((r) =>
@@ -1434,6 +1774,7 @@
 				"tr",
 				{ key: rt.id, onClick: () => flyToCoords(rt.center, 12), title: "Jump to " + rt.name, style: { cursor: "pointer" } },
 				h("td", { style: { padding: "3px 6px 3px 0" } }, routeBullet(rt)),
+				h("td", { style: { padding: "3px 6px", textAlign: "right", whiteSpace: "nowrap", opacity: 0.85 } }, fmtLen(rt.lengthM)),
 				h("td", { style: { padding: "3px 6px", textAlign: "right" } }, rateCell(rt.capture)),
 				h("td", { style: { padding: "3px 6px", textAlign: "right", fontWeight: 600 } }, fmt(rt.riders)),
 				h("td", { style: { padding: "3px 0", textAlign: "right", color: CONV_COLOR, fontWeight: 600 } }, fmt(rt.drivers))
@@ -1449,6 +1790,7 @@
 					"tr",
 					{ style: { opacity: 0.55, textAlign: "left" } },
 					h("th", { style: { padding: "0 6px 4px 0" } }, "Route"),
+					h("th", { style: { padding: "0 6px 4px", textAlign: "right" } }, "Length"),
 					h("th", { style: { padding: "0 6px 4px", textAlign: "right" } }, "Rate"),
 					h("th", { style: { padding: "0 6px 4px", textAlign: "right" } }, "Riders"),
 					h("th", { style: { padding: "0 0 4px", textAlign: "right", color: CONV_COLOR } }, "Drivers")
@@ -1465,14 +1807,22 @@
 				? h("div", { style: { color: GAP_COLOR, margin: "8px 0" } }, "Demand data not loaded yet – coverage/gaps unavailable.")
 				: null,
 
-			sectionHead("Captured – potential reach (overlaps allowed)"),
+			sectionHead("Network – what you've built", "network"),
+			card([
+				StatLine("System length", fmtLen(s.systemLengthM), "all lines, one-way"),
+				StatLine("Track built", fmtLen(s.trackBuiltM), "every track on the map"),
+				s.trackPlannedM > 0 ? StatLine("Planned (blueprints)", fmtLen(s.trackPlannedM)) : null,
+				StatLine("Stations", fmt(s.stationCount)),
+			]),
+
+			sectionHead("Captured – potential reach (overlaps allowed)", "captured"),
 			card([
 				StatLine("Residents", fmt(s.coveredResidents)),
 				StatLine("Jobs", fmt(s.coveredJobs)),
 				StatLine("Double-covered", fmt(s.overlapResidents + s.overlapJobs), "(res+jobs)"),
 			]),
 
-			sectionHead("Mode shift – drivers you could win on today's network"),
+			sectionHead("Mode shift – drivers you could win on today's network", "modeShiftCard"),
 			card(
 				[
 					StatLine(
@@ -1488,7 +1838,7 @@
 				CONV_COLOR
 			),
 
-			sectionHead("Build here next – biggest unserved markets"),
+			sectionHead("Build here next – biggest unserved markets", "buildNext"),
 			card(
 				(s.topBuildTargets && s.topBuildTargets.length
 					? s.topBuildTargets.map((t, i) =>
@@ -1547,18 +1897,60 @@
 					borderTop: "1px solid rgba(128,128,128,0.18)",
 				},
 			},
-			sectionHead("Per-route: riders vs. drivers in reach"),
+			sectionHead("Per-route: riders vs. drivers in reach", "tablesRoute"),
 			routeTable,
-			sectionHead("Per-station: riders vs. drivers in reach"),
+			sectionHead("Per-station: riders vs. drivers in reach", "tablesStation"),
 			table
 		);
 
-		const body = h(
-			"div",
-			{ style: { marginTop: "6px" } },
-			leftCol,
-			rightCol
-		);
+		// Greenfield "Start here" – the demand hubs (same numbered dots on the map), shown only
+		// before any station exists (hands off to "Build here next" once you start building).
+		// Row N == map circle N. Red = residential hub, violet = job hub. Click flies there.
+		const hubColor = (k) => (k === "home" ? HUB_HOME : HUB_JOB);
+		const hubType = (k) => (k === "home" ? "residential" : "jobs");
+		const centerRow = (c) =>
+			h(
+				"div",
+				{
+					key: c.rank,
+					onClick: () => flyToCoords(c.coords, 13),
+					title: "Jump to demand hub #" + c.rank,
+					style: { display: "flex", justifyContent: "space-between", alignItems: "center", padding: "3px 0", cursor: "pointer" },
+				},
+				h(
+					"span",
+					null,
+					h("span", { style: { display: "inline-block", width: "20px", opacity: 0.55, fontWeight: 700, fontSize: "11px" } }, c.rank + "."),
+					h("span", { style: { display: "inline-block", width: "9px", height: "9px", borderRadius: "50%", background: hubColor(c.kind), marginRight: "7px", verticalAlign: "middle" } }),
+					h("span", { style: { fontWeight: 600 } }, fmt(c.kind === "home" ? c.residents : c.jobs)),
+					h("span", { style: { opacity: 0.7 } }, c.kind === "home" ? " residents" : " jobs"),
+					h("span", { style: { opacity: 0.45, fontSize: "10.5px" } }, c.kind === "home" ? "  ·  " + fmt(c.jobs) + " jobs" : "  ·  " + fmt(c.residents) + " residents")
+				),
+				h("span", { style: { fontSize: "10.5px", fontWeight: 600, whiteSpace: "nowrap", color: hubColor(c.kind) } }, hubType(c.kind))
+			);
+		const startHere =
+			s.stationCount === 0
+				? h(
+						"div",
+						null,
+						sectionHead("Start here – your first line"),
+						s.demandCenters && s.demandCenters.length
+							? card(
+									[
+										h("div", { style: { fontSize: "11px", opacity: 0.75, lineHeight: 1.45, marginBottom: "6px" } }, "Before you've built anything: your biggest residential hubs (red, ranks 1–5) and biggest job hubs (violet, ranks 6–10) – the same numbered areas on the map. A good first line connects a big red hub to a big violet one. Click a row to fly to that hub."),
+										...s.demandCenters.map(centerRow),
+									],
+									HUB_ACCENT
+							  )
+							: card([h("div", { style: { opacity: 0.6, fontSize: "11px" } }, "Demand data isn't available for this map yet.")], HUB_ACCENT),
+						h("div", { style: { fontSize: "10px", opacity: 0.55, marginTop: "5px", lineHeight: 1.5 } }, "Red = where people live (1–5), violet = where they work (6–10); each sized within its own group, and the row numbers match the areas on the map."),
+						h("div", { style: { fontSize: "10px", opacity: 0.5, marginTop: "12px" } }, "Coverage, mode-shift and per-line analytics activate once you build your first stations.")
+				  )
+				: null;
+		const body =
+			s.stationCount === 0
+				? h("div", { style: { marginTop: "6px" } }, startHere)
+				: h("div", { style: { marginTop: "6px" } }, leftCol, rightCol);
 
 			planningContent = h("div", { style: { paddingTop: "12px" } }, kpis, body);
 		} else {
@@ -1601,25 +1993,134 @@
 			tabBtn("efficiency", "Efficiency")
 		);
 
-		// ---- Setup tab: sectioned, with the key + glossary living here ----
-		const setupSection = (title, ...kids) =>
+		// ---- Setup tab: settings cards (header + caption, divided rows, switches right) ----
+		const sliderCtl = (min, max, step, value, onChange, chip) =>
 			h(
 				"div",
-				{ style: { marginBottom: "22px" } },
-				h(
-					"div",
-					{ style: { fontSize: "10.5px", textTransform: "uppercase", letterSpacing: "0.07em", opacity: 0.45, fontWeight: 700, marginBottom: "10px" } },
-					title
-				),
-				...kids
+				{ style: { display: "flex", alignItems: "center", gap: "8px" } },
+				h("input", { type: "range", min: min, max: max, step: step, value: value, onChange: onChange, style: { width: "150px", accentColor: "#5aa9e6" } }),
+				h("span", { style: { fontSize: "11px", fontWeight: 600, width: "38px", textAlign: "right", fontVariantNumeric: "tabular-nums", opacity: 0.85 } }, chip)
 			);
+		const segCtl = (options, current, onPick) =>
+			h(
+				"div",
+				{ style: { display: "inline-flex", border: "1px solid rgba(128,128,128,0.4)", borderRadius: "6px", overflow: "hidden" } },
+				options.map((o, i) =>
+					h(
+						"button",
+						{
+							key: o.id,
+							onClick: () => onPick(o.id),
+							title: o.label + " – no key needed",
+							style: {
+								padding: "4px 11px",
+								cursor: "pointer",
+								border: "none",
+								borderLeft: i ? "1px solid rgba(128,128,128,0.3)" : "none",
+								background: current === o.id ? "rgba(90,169,230,0.25)" : "transparent",
+								color: "inherit",
+								fontWeight: 600,
+								fontSize: "11px",
+								opacity: current === o.id ? 1 : 0.6,
+							},
+						},
+						o.label
+					)
+				)
+			);
+		const layerRow = (label, desc, dot, on, flip, infoKey) => [
+			setupRow(
+				h("span", { style: { display: "inline-flex", alignItems: "center" } }, label, infoIcon(infoKey)),
+				desc,
+				switchCtl(on, () => {
+					flip();
+					applyVisibility(api.utils.getMap());
+					savePrefs();
+					try {
+						api.ui.forceUpdate();
+					} catch (e) {}
+				}),
+				dot
+			),
+			infoBox(infoKey, true),
+		];
+		const speedRunning = speedSkipTarget != null;
+		const speedCtl = speedRunning
+			? h(
+					"div",
+					{ style: { display: "flex", alignItems: "center", gap: "10px" } },
+					h("span", { style: { fontSize: "11px", color: "#5aa9e6", fontWeight: 600, whiteSpace: "nowrap" } }, "Running → Day " + speedSkipTarget),
+					h("button", { onClick: speedCancelSkip, style: { padding: "5px 12px", cursor: "pointer", borderRadius: "6px", border: "1px solid rgba(224,86,60,0.7)", background: "rgba(224,86,60,0.14)", color: "#ff8a6c", fontWeight: 700, fontSize: "11px", whiteSpace: "nowrap" } }, "Stop")
+			  )
+			: h("button", { onClick: speedStartSkip, style: { padding: "6px 14px", cursor: "pointer", borderRadius: "6px", border: "none", background: "#5aa9e6", color: "#0c1722", fontWeight: 700, fontSize: "11.5px", whiteSpace: "nowrap" } }, "⏩ Run");
+		const proxyDot = (color) => h("span", { style: { display: "inline-block", width: "7px", height: "7px", borderRadius: "50%", background: color, marginRight: "7px", flexShrink: 0 } });
+		const proxyStatusRow = h(
+			"div",
+			{ style: { display: "flex", alignItems: "center", flexWrap: "wrap", gap: "4px", padding: "9px 14px", borderTop: "1px solid rgba(128,128,128,0.14)", fontSize: "11px" } },
+			proxyStatus === "up"
+				? [proxyDot("#39c35a"), h("span", { key: "t", style: { opacity: 0.75 } }, "Tile proxy connected")]
+				: proxyStatus === "down"
+				? [
+						proxyDot("#ffae57"),
+						h("span", { key: "t", style: { color: "#ffae57", lineHeight: 1.5 } }, "Proxy not running - satellite needs it. One-time setup: run "),
+						h("code", { key: "c", style: { background: "rgba(255,255,255,0.1)", padding: "0 4px", borderRadius: "3px" } }, "install-proxy.sh"),
+						h("button", { key: "b", onClick: copyProxyCmd, style: { marginLeft: "6px", padding: "2px 8px", cursor: "pointer", borderRadius: "4px", border: "1px solid rgba(128,128,128,0.4)", background: "transparent", color: "inherit", fontSize: "10px" } }, "Copy command"),
+				  ]
+				: [proxyDot("rgba(128,128,128,0.6)"), h("span", { key: "t", style: { opacity: 0.5 } }, "Checking proxy…")]
+		);
 		const setupContent = h(
 			"div",
-			{ style: { paddingTop: "18px" } },
-			setupSection("Map layers", toggles),
-			setupSection("Base imagery", satControls),
-			setupSection("Display", dotScaleRow),
-			setupSection("What it all means", glossaryContent)
+			{ style: { paddingTop: "16px" } },
+			setupCard("Game speed", "Fast-forward quiet stretches without overshooting.", [
+				setupRow("Max speed to next midnight", "Runs the game at full speed and pauses automatically at the start of the next day. Stop ends it early.", speedCtl),
+			]),
+			setupCard("Map layers", "Choose which overlays draw on the city map.", [
+				layerRow("Catchment", "Walk-reach circle around every station.", "#9aa5b0", showCircles, () => {
+					showCircles = !showCircles;
+				}, "catchment"),
+				layerRow("Latent demand", "Uncovered markets one extension would win.", CONV_COLOR, showConversion, () => {
+					showConversion = !showConversion;
+				}, "latent"),
+				layerRow("Demand hubs", "Biggest residential and job areas, for the first line.", HUB_ACCENT, showFirstLines, () => {
+					showFirstLines = !showFirstLines;
+				}, "hubs"),
+				layerRow("Stations", "Success-rate dot and % on every station.", "#ffffff", showStations, () => {
+					showStations = !showStations;
+				}, "stations"),
+				layerRow("Satellite", "Photographic imagery under the map.", "#5aa9e6", showSatellite, () => {
+					showSatellite = !showSatellite;
+					if (showSatellite) checkProxyHealth();
+				}, "satellite"),
+				layerRow("Buildings", "The game's own 3D buildings.", "#bdbdbd", showBuildings, () => {
+					showBuildings = !showBuildings;
+				}, "buildings"),
+			]),
+			setupCard("Base imagery", "Satellite sources are key-free; tiles stream through the local proxy.", [
+				h(
+					"div",
+					{ style: { opacity: showSatellite ? 1 : 0.55 } },
+					setupRow("Provider", "Esri is the default; Hybrid adds labels.", segCtl(SAT_PROVIDERS, satProvider, setSatProvider)),
+					setupRow("Opacity", null, sliderCtl(0, 1, 0.05, satOpacity, (e) => {
+						satOpacity = parseFloat(e.target.value);
+						applyVisibility(api.utils.getMap());
+						savePrefs();
+						try {
+							api.ui.forceUpdate();
+						} catch (e2) {}
+					}, Math.round(satOpacity * 100) + "%")),
+					proxyStatusRow
+				),
+			]),
+			setupCard("Display", "Visual preferences for the overlays.", [
+				setupRow("Station dot size", "Scales the station dots and their % labels.", sliderCtl(0.5, 2.5, 0.1, stationDotScale, (e) => {
+					stationDotScale = parseFloat(e.target.value);
+					applyDotScale();
+					savePrefs();
+					try {
+						api.ui.forceUpdate();
+					} catch (e2) {}
+				}, stationDotScale.toFixed(1) + "×")),
+			])
 		);
 
 		// ---- Efficiency tab: peak-hold Load Factor per line ----
@@ -2033,7 +2534,11 @@
 		);
 
 		const tabContent =
-			activeTab === "setup" ? setupContent : activeTab === "efficiency" ? efficiencyContent : planningContent;
+			activeTab === "setup"
+				? setupContent
+				: activeTab === "efficiency"
+				? efficiencyContent
+				: planningContent;
 
 		return h(
 			"div",
@@ -2083,6 +2588,11 @@
 	sampleEfficiency();
 	setInterval(sampleEfficiency, 2000);
 
+	// Speed "skip" midnight detector: onDayChange fires at the day rollover (exact midnight); the
+	// interval is a backstop if that hook is unavailable. Both no-op unless a skip is running.
+	if (api.hooks.onDayChange) api.hooks.onDayChange(speedCheckSkip);
+	setInterval(speedCheckSkip, 250);
+
 	// Satellite tile-proxy reachability: check at load and periodically while satellite is on,
 	// so the Setup tab can show a green check or guide the user to run the proxy.
 	checkProxyHealth();
@@ -2113,6 +2623,8 @@
 				[LYR_CONV, showConversion],
 				[LYR_STN, showStations],
 				[LYR_STN_LABEL, showStations],
+				[LYR_CEN, showFirstLines],
+				[LYR_CEN_LABEL, showFirstLines],
 				[LYR_SAT, showSatellite],
 			];
 			let needFix = false;
@@ -2135,4 +2647,20 @@
 			if (needFix) pushData();
 		} catch (e) {}
 	}, 300);
+
+	// Dev/test hook: inspect the greenfield first-line finder without the game UI.
+	window.networkPlanner = window.networkPlanner || {};
+	window.networkPlanner.debugFirstLines = function () {
+		return stats ? { cityResidents: stats.cityResidents, cityJobs: stats.cityJobs, cityCommuters: stats.cityCommuters, firstLines: stats.firstLines, demandCenters: stats.demandCenters } : null;
+	};
+	window.networkPlanner.debugNetworkLength = function () {
+		return stats
+			? {
+					systemLengthM: stats.systemLengthM,
+					trackBuiltM: stats.trackBuiltM,
+					trackPlannedM: stats.trackPlannedM,
+					perRoute: stats.perRoute.map((r) => ({ id: r.id, lengthM: r.lengthM })),
+			  }
+			: null;
+	};
 })();

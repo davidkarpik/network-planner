@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 #
-# Network Planner — one-time satellite tile-proxy installer (macOS)
+# Network Planner – one-time satellite tile-proxy installer (macOS)
 # ================================================================
 # Satellite imagery is OPTIONAL. The core mod (Planning + Efficiency) needs none of this.
 # The game blocks external tile domains, so satellite tiles are served from a tiny local
 # proxy on 127.0.0.1. This script registers that proxy as a macOS launch agent so it
-# starts automatically at login — run it ONCE and you never think about it again.
+# starts automatically at login – run it ONCE and you never think about it again.
 #
 # Usage:  bash install-proxy.sh          (from this mod folder)
 # Remove: bash install-proxy.sh --uninstall

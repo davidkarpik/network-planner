@@ -1,6 +1,9 @@
 #!/usr/bin/env node
 /**
  * Network Planner - satellite tile relay
+ * Copyright (C) 2026 David Karpik
+ * Licensed under the GNU General Public License v3.0 only (GPL-3.0-only);
+ * see the LICENSE file for the full text.
  * --------------------------------------
  * The game only permits map tiles from 127.0.0.1, so this small relay fetches imagery from
  * the chosen provider and returns it over localhost. Start it before playing:

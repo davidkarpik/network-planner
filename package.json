@@ -1,9 +1,9 @@
 {
   "name": "network-planner",
-  "version": "0.53.0",
+  "version": "0.54.0",
   "description": "A planning & analytics suite for Subway Builder: coverage, mode-shift potential, build-here-next, per-line load factor, load-by-hour, crowding contributors, and key-free satellite imagery.",
   "author": "David Karpik",
-  "license": "MIT",
+  "license": "GPL-3.0-only",
   "keywords": [
     "subway-builder",
     "subwaybuilder",

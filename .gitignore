@@ -1,5 +1,4 @@
-# Runtime artifacts — never commit
-maptiler-key.txt
+# Runtime artifacts - never commit
 tile-cache/
 *.log
 .DS_Store
