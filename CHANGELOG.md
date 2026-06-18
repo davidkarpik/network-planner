@@ -4,6 +4,30 @@ All notable changes to Network Planner, newest first. Each release's section is 
 the [release notes](https://github.com/davidkarpik/network-planner/releases); this file is
 the single source of truth.
 
+## 0.60.0 – 2026-06-18
+
+- Walk-shed catchments: each station's reach is traced along the city's real road network – a
+  pathfinding pass finds the streets you can actually walk in 5, 10 and 15 minutes, so
+  coverage hugs the grid and stops at rivers and highways instead of crossing them.
+  Blueprinted stations draw their reach live, in blue, so you can plan a whole multi-stop
+  extension before committing to build.
+- Per-station focus card: click any station for the catchment it serves (residents and jobs),
+  the net-new it uniquely adds over every other station, the share that is a genuine on-foot
+  walk, and its 5/10/15-minute bands.
+- Game/Walk count toggle: flip a station's count between what the sim credits – straight-line,
+  the way it predicts ridership – and what is actually reachable on foot along the streets.
+- Walkable %: a new measure of how much of a station's catchment is a real street walk versus
+  counted as in-range but cut off by a river or highway, so you can spot stops that score on
+  paper but really lean on transfers or driving.
+- Daily capacity advisor on the Efficiency tab: yesterday condensed into plain findings – add
+  trains where the game raised crowding alerts on a loaded line, harvest capacity where a line
+  ran near-empty for days, and watch the ambiguous cases. Per-line load factor keeps the
+  day-over-day trend and a one-word status.
+- Station markers simplified: each station shows just its transit-share %, in its color, so
+  the map reads cleanly under the catchments and demand layers.
+- More contextual "i" explanations, including what load factor measures and why a line's
+  rolling average can differ from the peak hour the advisor flags.
+
 ## 0.54.0 – 2026-06-10
 
 - Network length: a new "Network – what you've built" card on the Planning tab shows your

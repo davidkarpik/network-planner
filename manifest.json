@@ -1,11 +1,11 @@
 {
     "id": "network-planner",
     "name": "Network Planner",
-    "description": "A planning and analytics suite that shows where to expand, which lines need trains, when, and where crowding comes from: system and per-line length, walk-catchment coverage, mode-shift potential, a first-line finder for fresh maps, a ranked build-here-next list, per-line load factor and load-by-hour, and per-line crowding contributors. Optional key-free satellite basemaps.",
+    "description": "A planning and analytics suite that shows where to expand and which lines need more trains, when: real road-network walk-shed catchments with per-station coverage and net-new counts, a Game/Walk count toggle, system and per-line length, mode-shift potential, a first-line finder for fresh maps, a ranked build-here-next list, and a daily capacity advisor with per-line load factor. Optional key-free satellite basemaps.",
     "dependencies": {
         "subway-builder": ">=1.0.0"
     },
-    "version": "0.54.0",
+    "version": "0.60.0",
     "author": {
         "name": "David Karpik"
     },

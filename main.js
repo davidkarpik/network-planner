@@ -19,16 +19,15 @@
 	//   radiusMeters     = catchmentSeconds * WALKING_SPEED * walkSpeedMultiplier
 	// BASE is the 30-minute walk budget (60 * 30 = 1800s). For "standard": ~1800 m.
 	const BASE_CATCHMENT_SECONDS = 1800;
-	const CIRCLE_SIDES = 64;
 	const EARTH_R = 6378137; // meters
 
 	let WALK_SPEED = 1; // overwritten from game constants on map ready
 
-	// Catchment fill (theme-aware neutral gray, kept subtle and transparent over the map)
-	const FILL_DARK = "#aeb6c224";
-	const OUTLINE_DARK = "rgb(150, 160, 175)";
-	const FILL_LIGHT = "#52596624";
-	const OUTLINE_LIGHT = "rgb(90, 98, 110)";
+	// Isochrone walk-shed bands: real road-network reach from each station, coloured by walk-time.
+	// Close = hot/dark orange, far = light.
+	const ISO_BAND_MIN = [5, 10, 15];
+	const ISO_COLORS = ["#e35510", "#f57a1c", "#ffb469"];
+	const ISO_BP_COLOR = "#5aa9e6";
 	// Gap (uncovered demand, OUTSIDE any catchment) markers
 	const GAP_COLOR = "#ff5a3c";
 	// Conversion (drivers INSIDE a catchment – addressable, not yet won) markers
@@ -48,7 +47,6 @@
 	const SRC_CONV = "cpro-conversion";
 	const LYR_CONV = "cpro-conversion-points";
 	const SRC_STN = "cpro-stations";
-	const LYR_STN = "cpro-station-markers";
 	const LYR_STN_LABEL = "cpro-station-labels";
 	// First-line finder (greenfield): demand centers (clusters of residents/jobs), shown before
 	// any station exists to answer "where does my first line go?"
@@ -77,7 +75,6 @@
 	let catchDef = null,
 		gapDef = null,
 		convDef = null,
-		stnDef = null,
 		stnLabelDef = null,
 		cenDef = null,
 		cenLabelDef = null;
@@ -86,23 +83,10 @@
 	// Geometry
 	// ---------------------------------------------------------------------------
 
-	// Catchment ring as a local-projection circle: for radii of a few km the equirectangular
-	// lat/lon offset is visually exact and avoids per-vertex great-circle trig. Closed lon/lat ring.
-	function catchmentRing(lon, lat, radiusMeters, sides) {
-		const ring = new Array(sides + 1);
-		const dLat = radiusMeters / 111320; // degrees of latitude per metre
-		const dLon = radiusMeters / (111320 * Math.cos((lat * Math.PI) / 180) || 1e-6);
-		for (let i = 0; i < sides; i++) {
-			const a = (i / sides) * 2 * Math.PI;
-			ring[i] = [lon + dLon * Math.cos(a), lat + dLat * Math.sin(a)];
-		}
-		ring[sides] = ring[0];
-		return ring;
-	}
 
 	// Irregular "blob" ring: an organic, aerial demand-area outline (deterministic from `seed`, so
 	// each hub keeps a stable unique shape across recomputes). Used for the greenfield demand hubs
-	// so they read as soft regions on the ground, not crisp circle markers like the other overlays.
+	// so they read as soft regions on the ground rather than hard-edged markers like the other overlays.
 	function blobRing(lon, lat, radiusMeters, seed) {
 		const sides = 30;
 		const ring = new Array(sides + 1);
@@ -150,6 +134,13 @@
 	// ---------------------------------------------------------------------------
 
 	let catchmentFC = { type: "FeatureCollection", features: [] };
+	let bpKey = null; // blueprint-station signature (id@coords) – the 1 s watcher recomputes on change
+	function bpSignature(list) {
+		return list
+			.map((s) => String(s.id) + "@" + s.coords[0].toFixed(5) + "," + s.coords[1].toFixed(5))
+			.sort()
+			.join("|");
+	}
 	let gapFC = { type: "FeatureCollection", features: [] };
 	let conversionFC = { type: "FeatureCollection", features: [] };
 	let stationFC = { type: "FeatureCollection", features: [] };
@@ -323,12 +314,14 @@
 	let transientSkips = 0;
 
 	function compute() {
-		// Constructed stations only – blueprints are planned, not built, so they must NOT
-		// count toward coverage/conversion or draw catchment circles (that also kills the
-		// stale-circle-after-blueprint-delete glitch).
-		const stations = (api.gameState.getStations() || []).filter(
-			(s) => s && s.coords && s.buildType !== "blueprint"
-		);
+		// Constructed stations drive every STATISTIC (coverage / conversion / per-station) –
+		// blueprints are planned, not built, so they stay out of the numbers. Their walk-sheds
+		// DO draw though (in blueprint blue), so you can tile coverage while sketching a line.
+		// Blueprint deletion fires no hook, so a 1 s signature watcher at module tail recomputes
+		// when blueprints change.
+		const allStations = (api.gameState.getStations() || []).filter((s) => s && s.coords);
+		const stations = allStations.filter((s) => s.buildType !== "blueprint");
+		const blueprints = allStations.filter((s) => s.buildType === "blueprint");
 
 		// If the constructed count shrank without a deletion event, treat it as a transient
 		// bad read and keep the last good result – but accept it if it persists (a real
@@ -340,26 +333,19 @@
 		transientSkips = 0;
 		deletionSignaled = false;
 		lastGoodStationCount = stations.length;
+		// only mark the blueprint state as rendered once we're actually rebuilding (an early
+		// return above must leave the watcher armed, or a coinciding blueprint change is lost)
+		bpKey = bpSignature(blueprints);
 
-		// Build accurate catchment circles + per-station radius
+		// Per-station catchment radius (still drives the coverage counts below).
 		const radii = new Array(stations.length);
-		const features = [];
 		for (let i = 0; i < stations.length; i++) {
-			const stn = stations[i];
-			const c = stn.coords;
-			if (!c) continue;
-			const r = catchmentRadiusMeters(stn);
-			radii[i] = r;
-			features.push({
-				type: "Feature",
-				properties: { stationId: stn.id },
-				geometry: {
-					type: "Polygon",
-					coordinates: [catchmentRing(c[0], c[1], r, CIRCLE_SIDES)],
-				},
-			});
+			const c = stations[i].coords;
+			radii[i] = c ? catchmentRadiusMeters(stations[i]) : 0;
 		}
-		catchmentFC = { type: "FeatureCollection", features };
+		// The catchment OVERLAY is a road-network walk-shed: per station, Dijkstra to the
+		// 15-min budget, each reachable street coloured by band.
+		catchmentFC = buildWalkshedFC(stations, blueprints);
 
 		const s = emptyStats();
 		s.stationCount = stations.length;
@@ -451,7 +437,7 @@
 			// Level 2 + journey-level conversion layer. A driver is genuinely convertible
 			// only when BOTH ends are walkable to a station. We also accumulate, per point,
 			// the drivers whose OPPOSITE end is already served – i.e., serving THIS point
-			// would win them. That's the non-geometric insight the circles can't show.
+			// would win them. That's the non-geometric insight a plain coverage radius can't show.
 			const pointConv = new Map();
 			const addConv = (pid, amt) => {
 				if (pid) pointConv.set(pid, (pointConv.get(pid) || 0) + amt);
@@ -588,6 +574,7 @@
 		per.sort((a, b) => b.drivers - a.drivers);
 		s.perStation = per;
 		computeGreenfield(demand, s);
+		computeWalkCounts(stations, blueprints, demand, s);
 		stats = s;
 
 		pushData();
@@ -730,7 +717,6 @@
 	const linePeaks = new Map();
 	let effSaveKey = null; // save we've loaded efficiency data for (persistence is per-save)
 	const EFF_KEY_PREFIX = "cpro_eff_";
-	const expandedLines = new Set(); // routeIds expanded to show their per-station breakdown
 
 	// Game-speed control (Setup tab). Uses the game's own api.actions; no third-party mod code.
 	const SPEED_MAX_TURBO = 8; // push the game's 'ultrafast' tier to its practical maximum
@@ -764,14 +750,30 @@
 			api.ui.forceUpdate();
 		} catch (e) {}
 	}
-	function speedCancelSkip() {
-		speedSkipTarget = null;
+	// Ending a skip: restore speed FIRST, pause LAST – the game's speed actions settle via
+	// microtasks and can clobber an earlier setPause (seen in play: the run ends but the game
+	// keeps going at normal speed). Because that clobbering is a race, also hold the pause for
+	// a short window afterwards: if the game un-pauses itself right after the stop (speed-call
+	// side effects, day-rollover processing), re-assert it. One-shot calls have no retry.
+	let speedPauseHoldUntil = 0;
+	function speedFinishStop() {
 		gameTurbo(1);
-		gamePause(true);
 		gameSpeed("normal");
+		gamePause(true);
+		speedPauseHoldUntil = Date.now() + 1200;
 		try {
 			api.ui.forceUpdate();
 		} catch (e) {}
+	}
+	function speedHoldPause() {
+		if (!speedPauseHoldUntil || Date.now() > speedPauseHoldUntil) return;
+		try {
+			if (api.gameState.isPaused && api.gameState.isPaused() === false) gamePause(true);
+		} catch (e) {}
+	}
+	function speedCancelSkip() {
+		speedSkipTarget = null;
+		speedFinishStop();
 	}
 	// Runs on each in-game day rollover (and a polling backstop). Pauses EXACTLY at midnight when an
 	// active skip reaches its target day, then drops back to normal speed for the next unpause.
@@ -783,14 +785,212 @@
 		} catch (e) {}
 		if (d == null || d >= speedSkipTarget) {
 			speedSkipTarget = null;
-			gameTurbo(1);
-			gamePause(true);
-			gameSpeed("normal");
-			try {
-				api.ui.forceUpdate();
-			} catch (e) {}
+			speedFinishStop();
 		}
 	}
+	// ---- Daily capacity advisor ----
+	// At each day rollover, the ended day condenses into a record: per line, the hourly
+	// peak loads the sampler tagged with that day, trains and capacity, plus the day's
+	// failure episodes from the game's own onWarning feed (stuck passengers / trains at
+	// capacity, deduped per type+station+hour). advComputeFindings turns the log into
+	// capacity findings: ADD (alerts + corroborating load), REDUCE (a bracket quiet and
+	// alert-free for days), WATCH (hot load without failures, or station alerts no line
+	// explains), RESOLVED (your train change cleared yesterday's finding).
+
+	const ADV_LOAD_CORROB = 0.9; // load that convicts a line when a failure alert touches it
+	const ADV_WATCH_LOAD = 1.1; // boardings-per-seat level worth watching without alerts
+	const ADV_WATCH_HOURS = 2; // sustained hours needed for a watch finding
+	const ADV_REMOVE_LOAD = 0.2; // ceiling for "this bracket is over-served"
+	const ADV_REMOVE_DAYS = 3; // consecutive quiet days before recommending cuts
+	const ADV_MAX_DAYS = 30; // day records kept per save
+	const ADV_KEY_PREFIX = "cpro_adv_";
+	let dayLog = []; // [{day, lines:{rid:{bullet,color,trainCount,capacity,load[24],tph[24]}}, episodes:[]}]
+	const advEpisodes = new Map(); // current day's failure episodes, key type|station|hour
+
+	// The game's service-frequency brackets (hour -> bracket), same boundaries as the
+	// Efficiency chart shading: High 06-09 & 16-19, Medium 05, 09-16, 19, Low 00-05 & 20-24.
+	function advBracketOfHour(hr) {
+		if ((hr >= 6 && hr <= 8) || (hr >= 16 && hr <= 18)) return "high";
+		if (hr === 5 || (hr >= 9 && hr <= 15) || hr === 19) return "med";
+		return "low";
+	}
+
+	// Max non-null load in a bracket's hours (bracket null = whole day); null = no data.
+	function advMaxLoad(lineRec, bracket) {
+		let m = null;
+		for (let hr = 0; hr < 24; hr++) {
+			if (bracket && advBracketOfHour(hr) !== bracket) continue;
+			const v = lineRec && lineRec.load ? lineRec.load[hr] : null;
+			if (v != null && (m == null || v > m)) m = v;
+		}
+		return m;
+	}
+
+	// One day's hard evidence: failure episodes grouped into (line, bracket) pairs where the
+	// line's load corroborates (>= ADV_LOAD_CORROB), plus episodes no line explains (orphans –
+	// network-shape suspects rather than frequency problems).
+	function advAddSignals(rec) {
+		const adds = new Map(); // "rid|bracket" -> {routeId, bracket, episodes, maxStuck, maxLoad, stations}
+		const orphan = new Map(); // stationId -> {station, episodes, lines}
+		if (!rec) return { adds, orphan };
+		for (const ep of rec.episodes || []) {
+			const B = advBracketOfHour(ep.hr);
+			let convicted = false;
+			for (const rid of ep.routes || []) {
+				const lr = rec.lines ? rec.lines[rid] : null;
+				const ml = lr ? advMaxLoad(lr, B) : null;
+				if (ml != null && ml >= ADV_LOAD_CORROB) {
+					convicted = true;
+					const k = rid + "|" + B;
+					const a = adds.get(k) || { routeId: rid, bracket: B, episodes: 0, maxStuck: 0, maxLoad: ml, stations: [] };
+					a.episodes++;
+					if (ep.t === "stuck") a.maxStuck = Math.max(a.maxStuck, ep.mag || 0);
+					if (ml > a.maxLoad) a.maxLoad = ml;
+					if (a.stations.indexOf(ep.stName) < 0) a.stations.push(ep.stName);
+					adds.set(k, a);
+				}
+			}
+			if (!convicted) {
+				const o = orphan.get(ep.st) || { station: ep.stName, episodes: 0, lines: [] };
+				o.episodes++;
+				for (const rid of ep.routes || []) if (o.lines.indexOf(rid) < 0) o.lines.push(rid);
+				orphan.set(ep.st, o);
+			}
+		}
+		return { adds, orphan };
+	}
+
+	// Findings for the last complete day. Kinds: add / remove / watch / watch-station / resolved.
+	function advComputeFindings(dayLog) {
+		const out = [];
+		if (!Array.isArray(dayLog) || !dayLog.length) return out;
+		const rec = dayLog[dayLog.length - 1];
+		const prev = dayLog.length > 1 ? dayLog[dayLog.length - 2] : null;
+		const sig = advAddSignals(rec);
+		const prevSig = advAddSignals(prev);
+		// ADD: alerts + corroborating load, with persistence count and trains-changed note
+		for (const a of sig.adds.values()) {
+			let days = 1;
+			for (let i = dayLog.length - 2; i >= 0; i--) {
+				if (advAddSignals(dayLog[i]).adds.has(a.routeId + "|" + a.bracket)) days++;
+				else break;
+			}
+			let dTrains = 0;
+			if (prev && prev.lines && prev.lines[a.routeId] && rec.lines && rec.lines[a.routeId]) {
+				dTrains = (rec.lines[a.routeId].trainCount || 0) - (prev.lines[a.routeId].trainCount || 0);
+			}
+			out.push({ kind: "add", routeId: a.routeId, bracket: a.bracket, episodes: a.episodes, maxStuck: a.maxStuck, maxLoad: a.maxLoad, stations: a.stations, days, dTrains, sev: a.episodes * 1000 + Math.round(a.maxLoad * 100) });
+		}
+		// RESOLVED: yesterday's add line + trains were added + today clean
+		if (prev) {
+			const prevAddRids = new Set();
+			for (const x of prevSig.adds.values()) prevAddRids.add(x.routeId);
+			for (const rid of prevAddRids) {
+				const lp = prev.lines ? prev.lines[rid] : null;
+				const lc = rec.lines ? rec.lines[rid] : null;
+				if (!lp || !lc) continue;
+				const dTrains = (lc.trainCount || 0) - (lp.trainCount || 0);
+				if (dTrains <= 0) continue;
+				let stillAdd = false;
+				for (const x of sig.adds.values()) if (x.routeId === rid) stillAdd = true;
+				const epToday = (rec.episodes || []).some((ep) => (ep.routes || []).indexOf(rid) >= 0);
+				const peakNow = advMaxLoad(lc, null);
+				if (!stillAdd && !epToday && (peakNow == null || peakNow < 1)) {
+					let prevEpisodes = 0;
+					for (const x of prevSig.adds.values()) if (x.routeId === rid) prevEpisodes += x.episodes;
+					out.push({ kind: "resolved", routeId: rid, dTrains, prevEpisodes, prevPeak: advMaxLoad(lp, null), curPeak: peakNow, sev: 0 });
+				}
+			}
+		}
+		// REMOVE: a bracket quiet (with data!) and alert-free for ADV_REMOVE_DAYS straight days
+		if (dayLog.length >= ADV_REMOVE_DAYS) {
+			const recent = dayLog.slice(-ADV_REMOVE_DAYS);
+			for (const rid in rec.lines || {}) {
+				for (const B of ["high", "med", "low"]) {
+					let ok = true;
+					let worst = 0;
+					for (const r of recent) {
+						const lr = r.lines ? r.lines[rid] : null;
+						const ml = lr ? advMaxLoad(lr, B) : null;
+						let hasService = false;
+						if (lr && lr.tph) for (let hr = 0; hr < 24; hr++) if (advBracketOfHour(hr) === B && lr.tph[hr] != null && lr.tph[hr] > 0) hasService = true;
+						const epAny = (r.episodes || []).some((ep) => (ep.routes || []).indexOf(rid) >= 0);
+						if (ml == null || ml > ADV_REMOVE_LOAD || epAny || !hasService) {
+							ok = false;
+							break;
+						}
+						if (ml > worst) worst = ml;
+					}
+					if (ok) out.push({ kind: "remove", routeId: rid, bracket: B, maxLoad: worst, sev: Math.round((ADV_REMOVE_LOAD - worst) * 100) });
+				}
+			}
+		}
+		// WATCH: hot boardings-per-seat with no failures (seat turnover can explain it)
+		const addRids = new Set();
+		for (const x of sig.adds.values()) addRids.add(x.routeId);
+		for (const rid in rec.lines || {}) {
+			if (addRids.has(rid)) continue;
+			const lr = rec.lines[rid];
+			let hot = 0,
+				mx = 0;
+			for (let hr = 0; hr < 24; hr++) {
+				const v = lr && lr.load ? lr.load[hr] : null;
+				if (v != null && v >= ADV_WATCH_LOAD) {
+					hot++;
+					if (v > mx) mx = v;
+				}
+			}
+			if (hot >= ADV_WATCH_HOURS) out.push({ kind: "watch", routeId: rid, hoursHigh: hot, maxLoad: mx, sev: hot });
+		}
+		for (const o of sig.orphan.values()) out.push({ kind: "watch-station", station: o.station, episodes: o.episodes, lines: o.lines, sev: o.episodes });
+		const rank = { add: 0, remove: 1, watch: 2, "watch-station": 3, resolved: 4 };
+		out.sort((a, b) => rank[a.kind] - rank[b.kind] || b.sev - a.sev);
+		return out;
+	}
+
+	function advPersist() {
+		try {
+			if (effSaveKey != null) window.localStorage.setItem(ADV_KEY_PREFIX + effSaveKey, JSON.stringify(dayLog));
+		} catch (e) {}
+	}
+
+	// Close out the day that just ended: snapshot each line's hourly loads (only hours the
+	// sampler tagged with that day – a late close-out never mixes two days), trains and
+	// capacity, attach the day's failure episodes, persist, re-render. Idempotent: the 4 s
+	// backstop covers a missing onDayChange hook without double-logging.
+	function advOnDayChange() {
+		let d = null;
+		try {
+			d = api.gameState.getCurrentDay();
+		} catch (e) {}
+		if (d == null || d < 2) return;
+		const ended = d - 1;
+		if (dayLog.length && dayLog[dayLog.length - 1].day >= ended) return;
+		if (!linePeaks.size && !advEpisodes.size) return; // nothing sampled yet
+		const lines = {};
+		linePeaks.forEach(function (p, rid) {
+			const load = new Array(24).fill(null);
+			for (let hr = 0; hr < 24; hr++) {
+				if (p.cur && p.curDay && p.curDay[hr] === ended && p.cur[hr] != null) load[hr] = p.cur[hr];
+			}
+			lines[rid] = {
+				bullet: p.bullet,
+				color: p.color,
+				trainCount: p.trainCount || 0,
+				capacity: p.capacity || 0,
+				load: load,
+				tph: p.tph ? p.tph.slice() : new Array(24).fill(null),
+			};
+		});
+		dayLog.push({ day: ended, lines: lines, episodes: Array.from(advEpisodes.values()) });
+		advEpisodes.clear();
+		while (dayLog.length > ADV_MAX_DAYS) dayLog.shift();
+		advPersist();
+		try {
+			api.ui.forceUpdate();
+		} catch (e) {}
+	}
+
 	function sampleEfficiency() {
 		let lm, trains;
 		try {
@@ -816,6 +1016,16 @@
 					for (const k in obj) if (obj[k]) linePeaks.set(k, obj[k]);
 				}
 			} catch (e) {}
+			// The advisor's day-log is per-save too: restore it alongside the profile.
+			dayLog = [];
+			advEpisodes.clear();
+			try {
+				const rawA = window.localStorage.getItem(ADV_KEY_PREFIX + saveName);
+				if (rawA) {
+					const arr = JSON.parse(rawA);
+					if (Array.isArray(arr)) dayLog = arr;
+				}
+			} catch (e) {}
 		}
 		let day;
 		try {
@@ -831,39 +1041,11 @@
 			elapsed = api.gameState.getElapsedSeconds();
 		} catch (e) {}
 		const hr = elapsed != null ? Math.floor((((elapsed % 86400) + 86400) % 86400) / 3600) : null;
-		// lazy station-name map (built once per sample, only if a line breakdown needs it)
-		let stnNames = null;
-		const nameOf = (id) => {
-			if (!stnNames) {
-				stnNames = {};
-				try {
-					(api.gameState.getStations() || []).forEach((s) => {
-						if (s && s.id) stnNames[s.id] = s.name;
-					});
-				} catch (e) {}
-			}
-			return stnNames[id] || id;
-		};
 		for (const m of lm) {
 			if (!m || !m.routeId) continue;
 			const prev = linePeaks.get(m.routeId) || {};
 			const cap = (m.trainsPerHour || 0) * (capByRoute[m.routeId] || prev.capacity || 0);
 			const load = cap > 0 ? (m.ridersPerHour || 0) / cap : null;
-			// per-station peak boardings on this line (for the expandable breakdown)
-			const stations = Object.assign({}, prev.stations || {});
-			try {
-				const rr = api.gameState.getRouteRidership(m.routeId);
-				const bs = rr && rr.byStation;
-				if (Array.isArray(bs)) {
-					for (const x of bs) {
-						if (!x || !x.stationId) continue;
-						const ex = stations[x.stationId] || { name: nameOf(x.stationId), peak: 0 };
-						ex.peak = Math.max(ex.peak || 0, x.popCount || 0);
-						if (!ex.name) ex.name = nameOf(x.stationId);
-						stations[x.stationId] = ex;
-					}
-				}
-			} catch (e) {}
 			// Per-HOUR rolling model: each hour keeps its latest peak (cur) + the value from the
 			// PREVIOUS time the clock passed it (prev). An hour only "rolls" when the clock next
 			// enters it on a new day – so nothing wipes globally at midnight; the chart morphs
@@ -871,6 +1053,7 @@
 			const cur = prev.cur ? prev.cur.slice() : new Array(24).fill(null);
 			const prevArr = prev.prev ? prev.prev.slice() : new Array(24).fill(null);
 			const curDay = prev.curDay ? prev.curDay.slice() : new Array(24).fill(null);
+			const tphArr = prev.tph ? prev.tph.slice() : new Array(24).fill(null); // trains/hr per hour, for the advisor's bracket checks
 			if (hr != null && load != null) {
 				if (day != null && curDay[hr] !== day) {
 					if (cur[hr] != null) prevArr[hr] = cur[hr]; // last pass becomes "yesterday this hour"
@@ -879,6 +1062,7 @@
 				}
 				cur[hr] = Math.max(cur[hr] || 0, load);
 			}
+			if (hr != null && m.trainsPerHour != null) tphArr[hr] = m.trainsPerHour;
 			linePeaks.set(m.routeId, {
 				routeId: m.routeId,
 				bullet: m.routeBullet || prev.bullet || "Line",
@@ -889,7 +1073,7 @@
 				cur: cur,
 				prev: prevArr,
 				curDay: curDay,
-				stations: stations,
+				tph: tphArr,
 			});
 		}
 		// drop lines no longer in the network, then persist this save's profile to localStorage
@@ -954,6 +1138,7 @@
 		} catch (e) {}
 	}
 	let stationDotScale = 1; // size multiplier for our station markers and % labels
+	let walkCountMode = "game"; // focus-card count basis: "game" = straight-line (what the sim credits), "walk" = street-reachable on foot
 
 	// Persist toggle state across sessions via localStorage (synchronous + reliable;
 	// persists in the renderer's Local Storage leveldb across full app quits).
@@ -974,27 +1159,18 @@
 					satProvider,
 					activeTab,
 					stationDotScale,
+					walkCountMode,
 				})
 			);
 		} catch (e) {}
 	}
 
-	// circle-radius expression for OUR station overlay dots, scaled by the slider
-	function stnRadiusExpr() {
-		// uniform dot sized purely by the user's slider – the % (color + label) is the
-		// data; the size is just a visual preference.
-		return 11 * (stationDotScale || 1);
-	}
-	// The "Station dot size" slider scales OUR overlay dots (the colored performance
-	// circles), not the game's markers. Update the live layer + the stored def.
+	// The "Station label size" slider scales our station % labels.
 	function applyDotScale() {
-		const expr = stnRadiusExpr();
-		if (stnDef && stnDef.paint) stnDef.paint["circle-radius"] = expr;
 		const textSize = 11 * (stationDotScale || 1);
 		if (stnLabelDef && stnLabelDef.layout) stnLabelDef.layout["text-size"] = textSize;
 		try {
 			const map = api.utils.getMap();
-			if (map && map.getLayer(LYR_STN)) map.setPaintProperty(LYR_STN, "circle-radius", expr);
 			if (map && map.getLayer(LYR_STN_LABEL)) map.setLayoutProperty(LYR_STN_LABEL, "text-size", textSize);
 		} catch (e) {}
 	}
@@ -1021,6 +1197,7 @@
 				if (typeof p.satProvider === "string" && SAT_PROVIDERS.some((sp) => sp.id === p.satProvider)) satProvider = p.satProvider;
 				if (typeof p.activeTab === "string") activeTab = p.activeTab;
 				if (typeof p.stationDotScale === "number") stationDotScale = p.stationDotScale;
+				if (p.walkCountMode === "game" || p.walkCountMode === "walk") walkCountMode = p.walkCountMode;
 			}
 		} catch (e) {}
 		// apply the restored state to the live map + panel (map may be null at module init)
@@ -1083,12 +1260,6 @@
 	}
 
 
-	function fillColor() {
-		return api.ui.getResolvedTheme() === "dark" ? FILL_DARK : FILL_LIGHT;
-	}
-	function outlineColor() {
-		return api.ui.getResolvedTheme() === "dark" ? OUTLINE_DARK : OUTLINE_LIGHT;
-	}
 
 	// Reuse a font the live style already has glyphs for (the game sets MAP_FONT);
 	// fall back to MapLibre's default stack.
@@ -1136,12 +1307,13 @@
 		if (!map.getLayer(LYR_CATCH)) {
 			catchDef = {
 				id: LYR_CATCH,
-				type: "fill",
+				type: "line",
 				source: SRC_CATCH,
-				layout: { visibility: showCircles ? "visible" : "none" },
+				layout: { visibility: showCircles ? "visible" : "none", "line-cap": "round", "line-join": "round" },
 				paint: {
-					"fill-color": fillColor(),
-					"fill-outline-color": outlineColor(),
+					"line-color": ["case", ["==", ["get", "bp"], 1], ISO_BP_COLOR, ["match", ["get", "band"], 0, ISO_COLORS[0], 1, ISO_COLORS[1], 2, ISO_COLORS[2], ISO_COLORS[2]]],
+					"line-width": ["interpolate", ["linear"], ["zoom"], 11, 0.7, 14, 1.6, 17, 3.2],
+					"line-opacity": 0.5,
 				},
 			};
 			api.map.registerLayer(catchDef);
@@ -1179,34 +1351,6 @@
 		}
 		if (!map.getSource(SRC_STN)) {
 			api.map.registerSource(SRC_STN, { type: "geojson", data: stationFC });
-		}
-		if (!map.getLayer(LYR_STN)) {
-			stnDef = {
-				id: LYR_STN,
-				type: "circle",
-				source: SRC_STN,
-				layout: { visibility: showStations ? "visible" : "none" },
-				paint: {
-					// size = driver pool (the opportunity) × the dot-size slider; color = capture
-					"circle-radius": stnRadiusExpr(),
-					"circle-color": [
-						"interpolate",
-						["linear"],
-						["get", "capture"],
-						0,
-						GAP_COLOR, // all drive → red (problem)
-						0.05,
-						CONV_COLOR, // amber
-						0.2,
-						"#4fd388", // converting well → green
-					],
-					"circle-opacity": 0.85,
-					"circle-stroke-color": "#ffffff",
-					"circle-stroke-width": 1.5,
-					"circle-stroke-opacity": 0.9,
-				},
-			};
-			api.map.registerLayer(stnDef);
 		}
 		// Station success-rate % drawn as a GL text layer on our own source (colored to match
 		// the dot). Rendered by the map, not injected into the game's DOM markers.
@@ -1320,14 +1464,7 @@
 			} catch (e) {}
 		};
 		vis(LYR_CATCH, showCircles);
-		if (map.getLayer(LYR_CATCH)) {
-			try {
-				map.setPaintProperty(LYR_CATCH, "fill-color", fillColor());
-				map.setPaintProperty(LYR_CATCH, "fill-outline-color", outlineColor());
-			} catch (e) {}
-		}
 		vis(LYR_CONV, showConversion);
-		vis(LYR_STN, showStations);
 		vis(LYR_STN_LABEL, showStations);
 		vis(LYR_CEN, showFirstLines);
 		vis(LYR_CEN_LABEL, showFirstLines);
@@ -1403,6 +1540,50 @@
 		compute();
 	});
 	if (api.hooks.onDemandChange) api.hooks.onDemandChange(() => compute());
+	// Advisor evidence: the game's own failure alerts. Stuck-passenger warnings carry
+	// details.waitingCount; train-at-capacity warnings carry currentOccupancy/maxCapacity.
+	// Deduped into episodes per type+station+hour (the game re-fires warnings in 30 s
+	// buckets with escalating thresholds; an episode keeps its peak magnitude).
+	if (api.hooks.onWarning)
+		api.hooks.onWarning(function (w) {
+			try {
+				// keep the latest raw payload for diagnosis (field names came from a bundle dig)
+				(window.networkPlanner = window.networkPlanner || {})._lastWarning = w;
+				const d = w && w.details;
+				if (!d || d.stationId == null) return;
+				let hr = 0;
+				try {
+					const el = api.gameState.getElapsedSeconds();
+					hr = el != null ? Math.floor((((el % 86400) + 86400) % 86400) / 3600) : 0;
+				} catch (e) {}
+				let t = null;
+				let mag = 0;
+				if (Number.isFinite(d.waitingCount)) {
+					t = "stuck";
+					mag = d.waitingCount;
+				} else if (Number.isFinite(d.currentOccupancy)) {
+					t = "cap";
+					mag = d.maxCapacity > 0 ? d.currentOccupancy / d.maxCapacity : 1;
+				} else return;
+				const key = t + "|" + d.stationId + "|" + hr;
+				const prevEp = advEpisodes.get(key);
+				if (prevEp) {
+					prevEp.mag = Math.max(prevEp.mag, mag);
+					(d.affectedRouteIds || []).forEach(function (r) {
+						if (prevEp.routes.indexOf(String(r)) < 0) prevEp.routes.push(String(r));
+					});
+				} else {
+					advEpisodes.set(key, {
+						t: t,
+						st: String(d.stationId),
+						stName: d.stationName || String(d.stationId),
+						hr: hr,
+						mag: mag,
+						routes: (d.affectedRouteIds || []).map(String),
+					});
+				}
+			} catch (e) {}
+		});
 
 	function pct(n, d) {
 		if (!d) return "–";
@@ -1417,8 +1598,8 @@
 		const km = m / 1000;
 		return (km >= 100 ? Math.round(km).toLocaleString() : km.toFixed(1)) + " km";
 	}
-	// success rate color – MUST match the LYR_STN circle's interpolate stops exactly
-	// (0 → red, 0.05 → amber, 0.2 → green), so the panel's capture dots match the map dots.
+	// success rate color – MUST match the station % label's interpolate stops exactly
+	// (0 → red, 0.05 → amber, 0.2 → green), so the panel's capture dots match the map %.
 	const CAPTURE_GREEN = "#4fd388";
 	function lerpHex(a, b, t) {
 		t = Math.max(0, Math.min(1, t));
@@ -1539,14 +1720,62 @@
 		);
 	}
 
+	let focusStationId = null; // station whose walk-shed detail shows in the Planning card (click a row)
+	// Walk-shed detail card for the focused station: the game catchment (straight-line, predicts
+	// ridership), net-new, the street-walkable share (the realism gap), and the 5/10/15-min bands.
+	function walkShedCard(s) {
+		if (focusStationId == null || !s || !s.walkStations) return null;
+		let ws = null;
+		for (const w of s.walkStations) if (w.id === focusStationId) ws = w;
+		if (!ws) return null;
+		let name = "Selected station";
+		for (const p of s.perStation || []) if (p.id === focusStationId) name = p.name;
+		const catchTot = ws.catchRes + ws.catchJobs;
+		const walkPct = catchTot > 0 ? Math.round(((ws.walkRes + ws.walkJobs) / catchTot) * 100) : 0;
+		const band = function (idx, mins) {
+			return StatLine(mins + "-min walk", fmt(Math.round(ws.bands[idx].res)) + " residents", fmt(Math.round(ws.bands[idx].jobs)) + " jobs");
+		};
+		const real = walkCountMode === "walk";
+		const cRes = real ? ws.walkRes : ws.catchRes;
+		const cJobs = real ? ws.walkJobs : ws.catchJobs;
+		const modeBtn = function (m, label, tip) {
+			const on = walkCountMode === m;
+			return h("button", { key: m, onClick: function () { walkCountMode = m; savePrefs(); try { api.ui.forceUpdate(); } catch (e) {} }, title: tip, style: { background: on ? "rgba(90,169,230,0.25)" : "transparent", color: "inherit", border: "none", padding: "2px 7px", fontSize: "9.5px", fontWeight: 700, letterSpacing: "0.04em", textTransform: "uppercase", cursor: "pointer", opacity: on ? 1 : 0.5 } }, label);
+		};
+		return h(
+			"div",
+			{ style: { marginTop: "12px" } },
+			h(
+				"div",
+				{ style: { display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "6px" } },
+				h("div", { style: { fontSize: "12.5px", fontWeight: 700 } }, name),
+				h(
+					"div",
+					{ style: { display: "flex", alignItems: "center", gap: "8px" } },
+					h("div", { style: { display: "inline-flex", borderRadius: "5px", overflow: "hidden", border: "1px solid rgba(128,128,128,0.3)" } }, modeBtn("game", "Game", "Counts the way the game credits this stop (straight-line)"), modeBtn("walk", "Walk", "Counts reachable on foot along the streets")),
+					h("button", { onClick: function () { focusStationId = null; try { api.ui.forceUpdate(); } catch (e) {} }, style: { background: "transparent", border: "none", color: "inherit", opacity: 0.5, cursor: "pointer", fontSize: "13px", lineHeight: 1 }, title: "Clear selection" }, "×")
+				)
+			),
+			h(
+				"div",
+				{ style: { display: "flex", flexWrap: "wrap", gap: "6px" } },
+				kpiCard(real ? "On-foot reach" : "Catchment", fmt(Math.round(cRes)), fmt(Math.round(cJobs)) + " jobs"),
+				kpiCard("Net-new", fmt(Math.round(ws.netNewRes)), fmt(Math.round(ws.netNewJobs)) + " jobs", CONV_COLOR),
+				kpiCard("Walkable", walkPct + "%", "of catchment a real walk", ISO_COLORS[0], "walkshed")
+			),
+			h("div", { style: { marginTop: "6px" } }, card([band(0, 5), band(1, 10), band(2, 15)]))
+		);
+	}
+
 	// ---- Inline "i" explanations: every concept is explained where it appears (no glossary
 	// page). One explanation open at a time; texts live in INFO so they stay in one place. ----
 	let openInfo = null; // key of the explanation currently expanded (not persisted)
 	const INFO = {
-		catchment: "Each station's walk catchment circle – about a 30-minute / ~1.8 km walk. The area people can reach on foot to or from the station.",
+		walkshed: "Catchment = residents and jobs the game credits this stop, measured straight-line the way the sim does (so it predicts ridership). Net-new = how many of those no other station already covers. Walkable % = how much of that catchment is a genuine on-foot walk along the streets, rather than blocked by a river or highway the game's straight-line model ignores. A low % is a stop that scores on paper but really leans on transfers, park-and-ride or driving. Use the Game/Walk toggle on the card to switch the count between what the sim credits (straight-line) and what's actually reachable on foot.",
+		catchment: "Each station's walk-shed – the streets reachable on foot within its catchment, routed along the real road network so it hugs the grid and stops at rivers and highways instead of crossing them. Blueprint stations show theirs in blue while you sketch a line. Click a station in the Planning list for its catchment counts, net-new coverage and walkable share.",
 		hubs: "For a fresh map with no stations: your biggest RESIDENTIAL hubs (red, ranks 1–5) and biggest JOB hubs (violet, ranks 6–10) – numbered areas, sized within each group. Shown separately on purpose: jobs cluster into a few dense spots while homes spread out, so the two need their own rankings. The Planning tab lists the same hubs; a good first line connects a big red hub to a big violet one.",
 		latent: "Would-be riders: people who drive today and whose OTHER trip end is already on your network – one extension wins them. SIZE (3 tiers) = community potential (number of would-be riders). COLOR = cost = distance to your nearest station: green = near/cheap (build now) → amber → magenta = far/expensive (a corridor to grow toward). Exact numbers are in the Build here next list.",
-		stations: "A dot at each station showing its SUCCESS RATE. The % (and the dot color, red → amber → green) = of the motorized commuters within walking reach, the share who take transit instead of driving. Low % (red) = lots of nearby drivers not yet won to transit. Dot size is just your visual preference (the Display slider).",
+		stations: "The success-rate % at each station, colored red → amber → green: of the motorized commuters within walking reach, the share who take transit instead of driving. Low % (red) = lots of nearby drivers not yet won to transit. Label size is your visual preference (the Display slider).",
 		satellite: "Real photographic imagery as the base map. Pick a source under Base imagery – Esri (default), Google, Hybrid (satellite + labels), or OSM. All free, no key, no setup.",
 		buildings: "The game's own 3D buildings. Turn off for a clean satellite view.",
 		greenfieldKpis: "Before you build, the headline numbers are city totals – Residents, Jobs, and Commuters (daily home→work trips). Busiest link is the single biggest home→work flow: your strongest first-line opportunity. These switch to coverage numbers once you build your first station.",
@@ -1558,8 +1787,10 @@
 		captured: "Residents and jobs with at least one station in walking reach. Double-covered = inside 2+ catchments (overlap – useful for transfers, wasteful for pure coverage).",
 		modeShiftCard: "Mode-shift potential = drivers whose home AND work are both within a catchment – winnable on today's network. Home end / Work end only = served at just ONE end; they need a stop at the other end before they can switch to transit.",
 		buildNext: "The ranked latent-demand shortlist (matching the map dots): each is the would-be riders at an uncovered market – people whose OTHER trip end is already on your network – plus the distance to your nearest station (the track you'd lay). Ranked by community size. Click a row to fly there.",
-		tablesRoute: "Length = the line's one-way route length, measured along its actual track path (branches count once). Rate = transit ÷ (transit + drivers) within reach – the colored dot matches the map. Riders / Drivers = daily transit users / drivers with this end in walking reach. Click a row to fly there. Reach is straight-line walk potential – planning estimates, not the sim's exact numbers.",
-		tablesStation: "Rate = transit ÷ (transit + drivers) within reach – the colored dot matches the map. Riders / Drivers = daily transit users / drivers with this end in walking reach. Click a row to fly there. Reach is straight-line walk potential – planning estimates, not the sim's exact numbers.",
+		tablesRoute: "Length = the line's one-way route length, measured along its actual track path (branches count once). Rate = transit ÷ (transit + drivers) within reach – the colored % matches the map. Riders / Drivers = daily transit users / drivers with this end in walking reach. Click a row to fly there. Reach is straight-line walk potential – planning estimates, not the sim's exact numbers.",
+		tablesStation: "Rate = transit ÷ (transit + drivers) within reach – the colored % matches the map. Riders / Drivers = daily transit users / drivers with this end in walking reach. Click a row to fly there. Reach is straight-line walk potential – planning estimates, not the sim's exact numbers.",
+		advisor: "Each day rollover condenses yesterday into capacity findings. ADD (red) = the game raised failure alerts (stuck passengers / trains at capacity) in hours where that line also ran at 90%+ load – add trains in the named service bracket. REDUCE (blue) = a bracket that stayed under 20% load for 3 straight days with no alerts and trains still running – capacity to harvest. WATCH (amber) = load above 110% with no failures (short trips reuse seats), or station alerts that no line's load explains (a shape problem, not frequency). RESOLVED (green) = you changed trains after a finding and the problem cleared. Alerts are the game's own; loads come from sampling, so fast-forwarded hours can be sparse.",
+		efficiency: "Load factor = riders per hour ÷ (trains per hour × train capacity). The table shows each line's rolling AVERAGE; the advisor above flags the PEAK hour, the busiest moment, where crowding actually bites. Other analytics tools may measure average load or a different basis, so a line can read fine there and red here – the two just answer different questions.",
 	};
 	const infoIcon = (key) =>
 		h(
@@ -1722,7 +1953,7 @@
 		const rows = s.perStation.map((r) =>
 			h(
 				"tr",
-				{ key: r.id, onClick: () => flyToCoords(r.coords, 14), title: "Jump to " + r.name, style: { cursor: "pointer" } },
+				{ key: r.id, onClick: () => { focusStationId = r.id; flyToCoords(r.coords, 14); try { api.ui.forceUpdate(); } catch (e) {} }, title: "Show walk-shed + jump", style: { cursor: "pointer", background: r.id === focusStationId ? "rgba(232,89,12,0.12)" : "transparent" } },
 				h("td", { style: { padding: "3px 6px 3px 0", whiteSpace: "nowrap" } }, r.name),
 				h("td", { style: { padding: "3px 6px", textAlign: "right" } }, rateCell(r.capture)),
 				h("td", { style: { padding: "3px 6px", textAlign: "right", fontWeight: 600 } }, fmt(r.riders)),
@@ -1883,7 +2114,7 @@
 			h(
 				"div",
 				{ style: { marginTop: "12px", fontSize: "10px", opacity: 0.5 } },
-				"Daily figures (time-stable). “Riders” = transit users with this end (home OR work) in walking reach; “Drivers” = drivers likewise. Rate / station-dot color = transit share of the two (red = mostly driving, green = high transit share). “Mode shift” is stricter: drivers whose home AND work are both within a catchment – winnable on today's network. Click any row to jump to it on the map."
+				"Daily figures (time-stable). “Riders” = transit users with this end (home OR work) in walking reach; “Drivers” = drivers likewise. Rate / station % color = transit share of the two (red = mostly driving, green = high transit share). “Mode shift” is stricter: drivers whose home AND work are both within a catchment – winnable on today's network. Click any row to jump to it on the map."
 			)
 		);
 
@@ -1952,7 +2183,7 @@
 				? h("div", { style: { marginTop: "6px" } }, startHere)
 				: h("div", { style: { marginTop: "6px" } }, leftCol, rightCol);
 
-			planningContent = h("div", { style: { paddingTop: "12px" } }, kpis, body);
+			planningContent = h("div", { style: { paddingTop: "12px" } }, walkShedCard(s), kpis, body);
 		} else {
 			planningContent = h("div", { style: { padding: "24px 6px", opacity: 0.7 } }, "Loading demand data…");
 		}
@@ -2075,7 +2306,7 @@
 				setupRow("Max speed to next midnight", "Runs the game at full speed and pauses automatically at the start of the next day. Stop ends it early.", speedCtl),
 			]),
 			setupCard("Map layers", "Choose which overlays draw on the city map.", [
-				layerRow("Catchment", "Walk-reach circle around every station.", "#9aa5b0", showCircles, () => {
+				layerRow("Catchment", "Walk-shed reach along the streets, per station.", "#9aa5b0", showCircles, () => {
 					showCircles = !showCircles;
 				}, "catchment"),
 				layerRow("Latent demand", "Uncovered markets one extension would win.", CONV_COLOR, showConversion, () => {
@@ -2084,7 +2315,7 @@
 				layerRow("Demand hubs", "Biggest residential and job areas, for the first line.", HUB_ACCENT, showFirstLines, () => {
 					showFirstLines = !showFirstLines;
 				}, "hubs"),
-				layerRow("Stations", "Success-rate dot and % on every station.", "#ffffff", showStations, () => {
+				layerRow("Stations", "Success-rate % on every station.", "#ffffff", showStations, () => {
 					showStations = !showStations;
 				}, "stations"),
 				layerRow("Satellite", "Photographic imagery under the map.", "#5aa9e6", showSatellite, () => {
@@ -2112,7 +2343,7 @@
 				),
 			]),
 			setupCard("Display", "Visual preferences for the overlays.", [
-				setupRow("Station dot size", "Scales the station dots and their % labels.", sliderCtl(0.5, 2.5, 0.1, stationDotScale, (e) => {
+				setupRow("Station label size", "Scales the station % labels.", sliderCtl(0.5, 2.5, 0.1, stationDotScale, (e) => {
 					stationDotScale = parseFloat(e.target.value);
 					applyDotScale();
 					savePrefs();
@@ -2169,46 +2400,27 @@
 				: v >= 0.25
 				? { label: "Healthy", color: "#39c35a" }
 				: { label: "Underused", color: "#5aa9e6" };
-		// Status column = a peak-hour ACTION/TREND (not the absolute level, which the bars
-		// already show): what to do + how the rush is moving vs yesterday's peak.
+		// Status column = yesterday's advisor verdict for the line: ONE rule set and ONE
+		// vocabulary shared with the findings cards above (alerts convict, load corroborates).
+		// The old peak-heuristic column contradicted the advisor on the same screen.
+		const advFindings = dayLog.length ? advComputeFindings(dayLog) : [];
+		const advDay = dayLog.length ? dayLog[dayLog.length - 1].day : null;
+		const advBracketShort = { high: "peak", med: "midday", low: "off-peak" };
+		const advByRoute = new Map(); // routeId -> strongest finding (findings sort actionable-first)
+		for (const af of advFindings) {
+			if (af.routeId != null && !advByRoute.has(String(af.routeId))) advByRoute.set(String(af.routeId), af);
+		}
 		const statusOf = (p) => {
-			const pk = peakLoadOf(p); // today's peak-hour load
-			if (pk == null) return { label: "–", color: "#888" };
-			const avg = avgLoadOf(p); // rolling average load across the hours
-			// off-peak (non-rush) average load – rush = 06-08 & 16-18
-			const cur = p.cur || [];
-			const isRush = (hr) => (hr >= 6 && hr <= 8) || (hr >= 16 && hr <= 18);
-			let ops = 0,
-				opn = 0;
-			for (let hr = 0; hr < 24; hr++) {
-				if (!isRush(hr) && cur[hr] != null) {
-					ops += cur[hr];
-					opn++;
-				}
-			}
-			const offPeak = opn ? ops / opn : null;
-			// peak-hour trend vs yesterday's peak
-			const pv = (p.prev || []).filter((x) => x != null);
-			const peakY = pv.length ? Math.max.apply(null, pv) : null;
-			const trend = peakY != null && peakY >= 0.05 ? (pk - peakY) / peakY : null;
-			if (pk >= 1.0) return { label: "Add peak trains", color: "#e0563c" }; // rush overcrowded
-			if (avg != null && avg < 0.2) return { label: "Over-served", color: "#5aa9e6" }; // wasted all day → cut trains
-			if (pk >= 0.5 && offPeak != null && offPeak < 0.12) return { label: "Trim off-peak", color: "#5aa9e6" }; // busy at rush, dead off-peak → cut Low/Med Demand
-			if (pk >= 0.6 && trend != null && trend >= 0.15) return { label: "Rising – watch peak", color: "#ffc83d" };
-			if (trend != null && trend <= -0.15) return { label: "Easing", color: "#5fe07a" };
-			return { label: "Balanced", color: "#39c35a" };
+			if (advDay == null) return { label: "–", color: "#888" }; // no complete day on record yet
+			const f = advByRoute.get(String(p.routeId));
+			if (!f) return { label: "OK", color: "#39c35a" };
+			if (f.kind === "add") return { label: "Add " + advBracketShort[f.bracket] + " trains", color: "#e0563c" };
+			if (f.kind === "remove") return { label: "Reduce " + advBracketShort[f.bracket] + " trains", color: "#5aa9e6" };
+			if (f.kind === "watch") return { label: "Watch", color: "#ffc83d" };
+			return { label: "Resolved", color: "#39c35a" };
 		};
 		const peaks = Array.from(linePeaks.values());
 		const effHasData = peaks.some((p) => p.cur && p.cur.some((x) => x != null));
-		// current in-game hour, to highlight "now" in the charts
-		const nowHr = (() => {
-			try {
-				const e = api.gameState.getElapsedSeconds();
-				return e != null ? Math.floor((((e % 86400) + 86400) % 86400) / 3600) : null;
-			} catch (x) {
-				return null;
-			}
-		})();
 		let totRiders = 0,
 			totCap = 0,
 			totTrains = 0;
@@ -2254,250 +2466,88 @@
 					h("td", { style: { padding: "6px 0", textAlign: "right", color: f.color, fontWeight: 600, fontSize: "11px", whiteSpace: "nowrap" } }, f.label)
 				);
 			});
-		// Load-by-hour: a 24-bar chart per line. Bar height = peak load that hour, colored by
-		// status – so you can read off which hours each line needs more trains.
-		const CHART_H = 34;
-		const NORM = 1.4; // 140% load = full-height bar
-		const barH = (v) => Math.max(2, (Math.min(v, NORM) / NORM) * CHART_H);
-		// Service-frequency brackets (from the game's Service-frequency tooltips – hardcoded
-		// because the API exposes only the per-bracket train counts, not the hour mapping):
-		//   High (rush): 06-09 & 16-19 · Medium: 05, 09-16, 19 · Low: 00-05 & 20-24.
-		// Shaded behind the bars (violet, distinct from the load colors) so you can tell which
-		// bracket an overcrowded hour falls in → which bracket's train count to raise/lower.
-		const bracketOf = (hr) => {
-			if ((hr >= 6 && hr <= 8) || (hr >= 16 && hr <= 18)) return "high";
-			if (hr <= 4 || hr >= 20) return "low";
-			return "medium";
+		// ---- Daily advisor: finding cards (advFindings/advDay computed above, by the table) ----
+		const advBracketLabel = { high: "High Demand", med: "Medium Demand", low: "Low Demand" };
+		const advBulletOf = (rid) => {
+			const rec = dayLog.length ? (dayLog[dayLog.length - 1].lines || {})[rid] : null;
+			const lp = linePeaks.get(rid);
+			const b = (rec && rec.bullet) || (lp && lp.bullet) || String(rid);
+			const c = (rec && rec.color) || (lp && lp.color) || "#888";
+			return h("span", { style: { display: "inline-block", padding: "1px 8px", borderRadius: "3px", background: c, color: "#fff", fontWeight: 700, fontSize: "11px", marginRight: "7px", whiteSpace: "nowrap" } }, b);
 		};
-		const bracketBg = (hr) => {
-			const b = bracketOf(hr);
-			return b === "high" ? "rgba(138,120,236,0.20)" : b === "medium" ? "rgba(138,120,236,0.10)" : "rgba(138,120,236,0.035)";
-		};
-		const hourBars = (today, prev) =>
+		const advCard = (key, accent, title, body) =>
 			h(
 				"div",
-				// paddingTop reserves room ABOVE the bars for the delta labels so they never sit on a bar
-				{ style: { display: "flex", alignItems: "flex-end", gap: "1px", paddingTop: "13px" } },
-				Array.from({ length: 24 }, (_, hr) => {
-					const t = today ? today[hr] : null; // today's load this hour
-					const y = prev ? prev[hr] : null; // yesterday's load this hour
-					// front bar = today if present, else yesterday faded (so the chart stays full
-					// after midnight: future hours show yesterday until today overwrites them)
-					const fv = t != null ? t : y;
-					const fHt = fv != null ? barH(fv) : 2;
-					const fCol = fv != null ? flagOf(fv).color : "rgba(128,128,128,0.18)";
-					const fOp = t != null ? 0.92 : y != null ? 0.34 : 1;
-					// ghost = yesterday's level behind today's bar, for instant compare
-					const showGhost = t != null && y != null;
-					// delta label: only when there's a meaningful baseline (y >= 10%) so a near-zero
-					// yesterday doesn't produce absurd "+1389%", and only when the move is >10%.
-					let delta = null,
-						deltaEl = null;
-					if (t != null && y != null && y >= 0.1) {
-						delta = (t - y) / y;
-						if (Math.abs(delta) >= 0.1) {
-							deltaEl = h(
-								"div",
-								{
-									style: {
-										position: "absolute",
-										left: "-3px",
-										right: "-3px",
-										bottom: fHt + 2 + "px", // always just ABOVE this bar's top
-										textAlign: "center",
-										fontSize: "7px",
-										fontWeight: 700,
-										color: delta > 0 ? "#ff7a5c" : "#5fe07a",
-										whiteSpace: "nowrap",
-										pointerEvents: "none",
-										textShadow: "0 0 3px #000, 0 0 3px #000",
-									},
-								},
-								(delta > 0 ? "+" : "") + Math.round(delta * 100) + "%"
-							);
-						}
-					}
-					return h(
-						"div",
-						{
-							key: hr,
-							title:
-								String(hr).padStart(2, "0") +
-								":00 – " +
-								(t != null ? "today " + Math.round(t * 100) + "%" : "today n/a") +
-								(y != null ? " · yest " + Math.round(y * 100) + "%" : ""),
-							style: { position: "relative", flex: "1 1 0", height: CHART_H + "px", background: "transparent", borderRadius: "1px" },
-						},
-						hr === nowHr ? h("div", { style: { position: "absolute", left: 0, right: 0, top: 0, bottom: 0, background: "rgba(255,255,255,0.14)", borderRadius: "1px" } }) : null,
-						showGhost ? h("div", { style: { position: "absolute", left: 0, right: 0, bottom: 0, height: barH(y) + "px", background: "rgba(255,255,255,0.20)", borderRadius: "1px" } }) : null,
-						fv != null ? h("div", { style: { position: "absolute", left: 0, right: 0, bottom: 0, height: fHt + "px", background: fCol, opacity: fOp, borderRadius: "1px" } }) : null,
-						deltaEl
-					);
-				})
+				{ key: key, style: { border: "1px solid rgba(128,128,128,0.18)", borderLeft: "3px solid " + accent, borderRadius: "4px", padding: "8px 11px", marginBottom: "6px", background: "rgba(255,255,255,0.03)" } },
+				h("div", { style: { fontWeight: 700, fontSize: "12px", display: "flex", alignItems: "center", flexWrap: "wrap" } }, title),
+				h("div", { style: { fontSize: "11px", opacity: 0.75, marginTop: "3px", lineHeight: 1.5 } }, body)
 			);
-		const hourAxis = h(
-			"div",
-			{ style: { display: "flex", marginTop: "2px" } },
-			Array.from({ length: 24 }, (_, hr) =>
-				h("div", { key: hr, style: { flex: "1 1 0", textAlign: "center", fontSize: "8px", opacity: 0.4 } }, hr % 6 === 0 ? String(hr).padStart(2, "0") : "")
-			)
-		);
-		// expandable per-station boardings for a line (busiest stops = where demand concentrates)
-		// station id -> coords, built once (for the click-to-fly in the per-line breakdown)
-		let stnCoords = null;
-		const coordsOf = (id) => {
-			if (!stnCoords) {
-				stnCoords = {};
-				try {
-					(api.gameState.getStations() || []).forEach((s) => {
-						if (s && s.id) stnCoords[s.id] = s.coords;
-					});
-				} catch (e) {}
-			}
-			return stnCoords[id];
-		};
-		// Per-line crowding contributors: that line's busiest boarding stops (boardings = where
-		// demand originates; the game doesn't expose true on-board load). Click a stop to fly to it.
-		const stationBreakdown = (p) => {
-			const sts = Object.keys(p.stations || {})
-				.map((sid) => ({ sid: sid, name: p.stations[sid].name, peak: p.stations[sid].peak || 0 }))
-				.filter((s) => s.peak > 0)
-				.sort((a, b) => b.peak - a.peak);
-			if (!sts.length)
-				return h("div", { style: { fontSize: "10px", opacity: 0.5, margin: "2px 0 10px 18px" } }, "No station boardings recorded yet (they read 0 at night – run a busy hour).");
-			const maxP = sts[0].peak || 1;
-			const total = sts.reduce((s, e) => s + e.peak, 0) || 1;
-			return h(
-				"div",
-				{ style: { margin: "4px 0 10px 18px" } },
-				h("div", { style: { fontSize: "9px", textTransform: "uppercase", letterSpacing: "0.05em", opacity: 0.4, marginBottom: "4px" } }, "Crowding contributors – boardings by station"),
-				sts.map((s, si) =>
-					h(
-						"div",
-						{
-							key: si,
-							onClick: () => {
-								const co = coordsOf(s.sid);
-								if (co) flyToCoords(co, 13);
-							},
-							title: "Jump to " + s.name,
-							style: { display: "flex", alignItems: "center", gap: "6px", marginBottom: "2px", cursor: "pointer" },
-						},
-						h("span", { style: { fontSize: "10px", width: "130px", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", opacity: 0.8 } }, s.name),
-						h(
-							"div",
-							{ style: { flex: "1 1 0", height: "8px", background: "rgba(128,128,128,0.12)", borderRadius: "2px", overflow: "hidden" } },
-							h("div", { style: { width: Math.round((s.peak / maxP) * 100) + "%", height: "100%", background: p.color, opacity: 0.85, borderRadius: "2px" } })
-						),
-						h("span", { style: { fontSize: "10px", width: "48px", textAlign: "right", fontWeight: 600 } }, nfmt(s.peak)),
-						h("span", { style: { fontSize: "10px", width: "38px", textAlign: "right", opacity: 0.6 } }, Math.round((s.peak / total) * 100) + "%")
-					)
-				)
+		const advItems = advFindings.map((f, i) => {
+			const key = "adv" + i;
+			if (f.kind === "add")
+				return advCard(
+					key,
+					"#e0563c",
+					[advBulletOf(f.routeId), "Add " + advBracketLabel[f.bracket] + " trains" + (f.days > 1 ? " · " + f.days + " days running" : "")],
+					(f.maxStuck > 0
+						? f.episodes + " stuck-passenger episode" + (f.episodes > 1 ? "s" : "") + " at " + f.stations.join(", ") + " (max " + fmt(f.maxStuck) + " waiting)"
+						: f.episodes + " at-capacity train alert" + (f.episodes > 1 ? "s" : "") + " at " + f.stations.join(", ")) +
+						" · peak load " + Math.round(f.maxLoad * 100) + "% in those hours" +
+						(f.dTrains > 0 ? " · you added " + f.dTrains + " train" + (f.dTrains > 1 ? "s" : "") + " – not enough yet" : "")
+				);
+			if (f.kind === "remove")
+				return advCard(
+					key,
+					"#5aa9e6",
+					[advBulletOf(f.routeId), "Reduce " + advBracketLabel[f.bracket] + " trains"],
+					"Load never passed " + Math.round(ADV_REMOVE_LOAD * 100) + "% in " + advBracketLabel[f.bracket] + " hours for " + ADV_REMOVE_DAYS + " straight days, with no alerts on the line – capacity you can harvest."
+				);
+			if (f.kind === "watch")
+				return advCard(
+					key,
+					"#ffc83d",
+					[advBulletOf(f.routeId), "Watch – boardings outpace seats"],
+					"Load reached " + Math.round(f.maxLoad * 100) + "% across " + f.hoursHigh + " hours but produced no failure alerts – short trips can reuse seats. No action needed yet."
+				);
+			if (f.kind === "watch-station")
+				return advCard(
+					key,
+					"#ffc83d",
+					["Station " + f.station + " – alerts without an overloaded line"],
+					f.episodes + " alert episode" + (f.episodes > 1 ? "s" : "") + " while every serving line stayed under " + Math.round(ADV_LOAD_CORROB * 100) + "% load – likely a transfer or network-shape issue rather than train frequency."
+				);
+			return advCard(
+				key,
+				"#39c35a",
+				[advBulletOf(f.routeId), "Resolved – your change worked"],
+				"Trains +" + f.dTrains + " · alert episodes " + f.prevEpisodes + " → 0 · peak load " + (f.prevPeak != null ? Math.round(f.prevPeak * 100) + "%" : "–") + " → " + (f.curPeak != null ? Math.round(f.curPeak * 100) + "%" : "–") + "."
 			);
-		};
-		// Service-frequency legend (once, above all routes) + dashed boundary lines down the charts.
-		const brkRuns = [];
-		for (let h = 0; h < 24; h++) {
-			const b = bracketOf(h);
-			const last = brkRuns[brkRuns.length - 1];
-			if (last && last.b === b) last.len++;
-			else brkRuns.push({ b: b, len: 1 });
-		}
-		const brkLabel = { high: "High", medium: "Med", low: "Low" };
-		const brkColor = { high: "#b3a6f5", medium: "rgba(179,166,245,0.7)", low: "rgba(179,166,245,0.45)" };
-		const bracketLegend = h(
+		});
+		const advisorSection = h(
 			"div",
-			{ style: { display: "flex", gap: "1px", height: "14px", marginBottom: "6px" } },
-			brkRuns.map((r, i) =>
-				h(
-					"div",
-					{ key: i, style: { flex: r.len + " 1 0", display: "flex", alignItems: "center", justifyContent: "center", fontSize: "8.5px", fontWeight: 700, color: brkColor[r.b], whiteSpace: "nowrap", overflow: "hidden", borderBottom: "1px solid rgba(138,120,236,0.3)" } },
-					r.len >= 2 ? brkLabel[r.b] : brkLabel[r.b].charAt(0)
-				)
-			)
-		);
-		const boundaries = [];
-		for (let h = 1; h < 24; h++) if (bracketOf(h) !== bracketOf(h - 1)) boundaries.push(h);
-		const dashedLines = h(
-			"div",
-			{ style: { position: "absolute", top: 0, left: 0, right: 0, bottom: 0, pointerEvents: "none" } },
-			boundaries.map((bh, i) =>
-				h("div", { key: i, style: { position: "absolute", top: 0, bottom: 0, left: (bh / 24) * 100 + "%", width: 0, borderLeft: "1px dashed rgba(255,255,255,0.16)" } })
-			)
-		);
-		const hourlySection = h(
-			"div",
-			{ style: { marginTop: "18px" } },
-			h("div", { style: { fontSize: "10px", textTransform: "uppercase", letterSpacing: "0.06em", opacity: 0.45, fontWeight: 700, marginBottom: "10px" } }, "Load by hour"),
-			h(
-				"div",
-				{ style: { position: "relative" } },
-				dashedLines,
-				bracketLegend,
-				peaks.map((p, i) => {
-					const open = expandedLines.has(p.routeId);
-					return h(
+			{ style: { marginBottom: "4px" } },
+			sectionHead(advDay != null ? "Yesterday – Day " + advDay : "Yesterday", "advisor"),
+			advDay == null
+				? h(
 						"div",
-						{ key: i, style: { marginBottom: "12px" } },
-						h(
-							"div",
-							{
-								onClick: () => {
-									if (open) expandedLines.delete(p.routeId);
-									else expandedLines.add(p.routeId);
-									try {
-										api.ui.forceUpdate();
-									} catch (e) {}
-								},
-								title: "Show load by station",
-								style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "4px", cursor: "pointer" },
-							},
-							h(
-								"span",
-								null,
-								h("span", { style: { opacity: 0.5, marginRight: "5px", fontSize: "9px" } }, open ? "▾" : "▸"),
-								h("span", { style: { display: "inline-block", padding: "1px 8px", borderRadius: "3px", background: p.color, color: "#fff", fontWeight: 700, fontSize: "11px" } }, p.bullet)
-							),
-							h("span", { style: { fontSize: "10px", opacity: 0.5 } }, "peak " + (peakLoadOf(p) == null ? "–" : Math.round(peakLoadOf(p) * 100) + "%"))
-						),
-						hourBars(p.cur, p.prev),
-						open ? stationBreakdown(p) : null
-					);
-				}),
-				hourAxis
-			),
-			h(
-				"div",
-				{ style: { fontSize: "10px", opacity: 0.5, marginTop: "6px", lineHeight: 1.5 } },
-				"Each bar = that hour's most recent peak load; the ghost behind it = the previous day's level for that hour; % = change vs then (red = busier, green = relieved). Bars update as the clock passes each hour – nothing wipes at midnight. Lit column = current hour."
-			),
-			h(
-				"div",
-				{ style: { fontSize: "10px", opacity: 0.5, marginTop: "4px", lineHeight: 1.5 } },
-				"Top strip = service-frequency bracket (dashed lines mark the boundaries): High (rush) 06–09 & 16–19 · Medium 05, 09–16, 19 · Low 00–05 & 20–24. A red bar in a High segment = raise High Demand trains."
-			)
+						{ style: { fontSize: "11px", opacity: 0.6, lineHeight: 1.5, marginBottom: "10px" } },
+						"No complete day on record yet. Run through a day (Setup → Max speed to next midnight) and capacity findings appear here."
+				  )
+				: advItems.length
+				? advItems
+				: h("div", { style: { fontSize: "11px", opacity: 0.6, marginBottom: "10px" } }, "No findings – service matched demand on Day " + advDay + ".")
 		);
+
 		const efficiencyContent = h(
 			"div",
 			{ style: { paddingTop: "16px", fontSize: "12px" } },
+			advisorSection,
 			!effHasData
 				? h(
 						"div",
 						{ style: { padding: "20px 4px", opacity: 0.7, lineHeight: 1.5 } },
 						h("div", { style: { fontWeight: 700, marginBottom: "6px" } }, "Run the game to populate efficiency"),
-						"Load Factor reads each line's PEAK ridership, which is 0 at night. Run unpaused through a busy hour and your lines fill in here automatically.",
-						h(
-							"div",
-							{ style: { marginTop: "12px", fontFamily: "monospace", fontSize: "10px", opacity: 0.6 } },
-							(() => {
-								try {
-									const lm = api.gameState.getLineMetrics() || [];
-									return "debug · sampled lines=" + linePeaks.size + " · live getLineMetrics: " + lm.length + " lines, ridersPerHour=" + lm.map((m) => m.ridersPerHour).join("/");
-								} catch (e) {
-									return "debug · sampled lines=" + linePeaks.size + " · getLineMetrics error: " + e;
-								}
-							})()
-						)
+						"Load Factor reads each line's PEAK ridership, which is 0 at night. Run unpaused through a busy hour and your lines fill in here automatically."
 				  )
 				: h(
 						"div",
@@ -2509,26 +2559,18 @@
 							kCard("Avg riders / hr", nfmt(totRiders), "across all lines"),
 							kCard("Trains", nfmt(totTrains), "deployed")
 						),
-						h("div", { style: { fontSize: "10px", textTransform: "uppercase", letterSpacing: "0.06em", opacity: 0.45, fontWeight: 700, marginBottom: "8px" } }, "Load factor by line"),
+						h("div", { style: { fontSize: "10px", textTransform: "uppercase", letterSpacing: "0.06em", opacity: 0.45, fontWeight: 700, marginBottom: "8px" } }, "Load factor by line", infoIcon("efficiency")),
+						infoBox("efficiency"),
 						h(
 							"table",
 							{ style: { width: "100%", borderCollapse: "collapse", fontSize: "11.5px" } },
 							h("thead", null, h("tr", null, effHead("Line"), effHead("Riders/hr", "right"), effHead("Trains/hr", "right"), effHead("Load", "right"), effHead("vs yest", "right"), effHead("Status", "right"))),
 							h("tbody", null, effRows)
 						),
-						hourlySection,
 						h(
 							"div",
 							{ style: { fontSize: "10px", opacity: 0.55, marginTop: "10px", lineHeight: 1.5 } },
-							"Load = riders/hr ÷ (trains/hr × train capacity). Table shows the rolling AVERAGE; ‘vs yest’ = change in that average vs the previous day; Status = a recommendation – Add peak trains (rush full) · Over-served / Trim off-peak (running more than demand needs → cut trains) · Rising / Easing (vs yesterday's peak) · Balanced. Bar colors: ",
-							h("span", { style: { color: "#e0563c" } }, "Overcrowded"),
-							" ≥100% · ",
-							h("span", { style: { color: "#ffc83d" } }, "Near capacity"),
-							" 75–100% · ",
-							h("span", { style: { color: "#39c35a" } }, "Healthy"),
-							" 25–75% · ",
-							h("span", { style: { color: "#5aa9e6" } }, "Underused"),
-							" <25%."
+							"Load = riders/hr ÷ (trains/hr × train capacity). Table shows the rolling AVERAGE; ‘vs yest’ = change in that average vs the previous day; Status = yesterday's advisor verdict for the line (same rules as the cards above) – Add/Reduce (bracket) trains · Watch · Resolved · OK = no findings."
 						)
 				  )
 		);
@@ -2588,10 +2630,38 @@
 	sampleEfficiency();
 	setInterval(sampleEfficiency, 2000);
 
-	// Speed "skip" midnight detector: onDayChange fires at the day rollover (exact midnight); the
-	// interval is a backstop if that hook is unavailable. Both no-op unless a skip is running.
-	if (api.hooks.onDayChange) api.hooks.onDayChange(speedCheckSkip);
-	setInterval(speedCheckSkip, 250);
+	// Day rollover work, ONE registration (the hook may keep only a single callback):
+	// close out the advisor's day first, then the speed-skip pause check – each isolated so
+	// a failure in one can never swallow the other. The intervals are backstops if the hook
+	// is unavailable; both functions are idempotent. The 250 ms tick also holds the pause
+	// for a moment after a skip ends (the game can clobber a one-shot setPause).
+	if (api.hooks.onDayChange)
+		api.hooks.onDayChange(function () {
+			try {
+				advOnDayChange();
+			} catch (e) {}
+			try {
+				speedCheckSkip();
+			} catch (e) {}
+		});
+	setInterval(function () {
+		speedCheckSkip();
+		speedHoldPause();
+	}, 250);
+	setInterval(advOnDayChange, 4000);
+
+	// Blueprint watcher: placement fires onBlueprintPlaced (instant recompute), but deleting
+	// or moving a blueprint fires NOTHING – poll a cheap id@coords signature so planned
+	// walk-sheds appear and vanish promptly instead of going stale.
+	setInterval(function () {
+		let key = null;
+		try {
+			key = bpSignature((api.gameState.getStations() || []).filter((s) => s && s.coords && s.buildType === "blueprint"));
+		} catch (e) {
+			return;
+		}
+		if (key !== bpKey) compute(); // compute() refreshes bpKey itself
+	}, 1000);
 
 	// Satellite tile-proxy reachability: check at load and periodically while satellite is on,
 	// so the Setup tab can show a green check or guide the user to run the proxy.
@@ -2621,7 +2691,6 @@
 			const want = [
 				[LYR_CATCH, showCircles],
 				[LYR_CONV, showConversion],
-				[LYR_STN, showStations],
 				[LYR_STN_LABEL, showStations],
 				[LYR_CEN, showFirstLines],
 				[LYR_CEN_LABEL, showFirstLines],
@@ -2663,4 +2732,408 @@
 			  }
 			: null;
 	};
+	// Inspect the capacity advisor without the UI: the day-log shape, episodes captured for
+	// the running day, and the findings exactly as the panel computes them.
+	window.networkPlanner.debugAdvisor = function () {
+		return {
+			days: dayLog.map((d) => ({ day: d.day, lines: Object.keys(d.lines || {}).length, episodes: (d.episodes || []).length })),
+			pendingEpisodes: Array.from(advEpisodes.values()),
+			lastWarning: window.networkPlanner._lastWarning || null,
+			findings: advComputeFindings(dayLog),
+		};
+	};
+
+	// ===== Walk-shed road graph: drives the isochrone catchment. =====
+	// The game exposes the full street network on the map ("roads-source": ~24k LineStrings with
+	// roadClass/structure/name). Roads are not pre-wired into a graph, so we snap shared vertices
+	// into nodes (split road data shares junction endpoints) and weight edges by ground metres.
+	// Built once per city and cached; Dijkstra from a station then yields a real pedestrian walk-shed.
+	let roadGraph = null;
+	let roadGraphErr = null;
+	const NODE_SNAP = 1e5; // round coords to 5 dp (~1 m) so coincident junction vertices merge into one node
+	const GRID_CELL = 0.003; // ~250 m spatial-hash cell for nearest-node lookup
+	const NON_WALK_ROAD = { highway: 1, motorway: 1, freeway: 1, trunk: 1, expressway: 1 };
+
+	function roadMeters(aLng, aLat, bLng, bLat) {
+		const mLat = 111320;
+		const mLng = 111320 * Math.cos((((aLat + bLat) / 2) * Math.PI) / 180);
+		const dx = (bLng - aLng) * mLng;
+		const dy = (bLat - aLat) * mLat;
+		return Math.sqrt(dx * dx + dy * dy);
+	}
+
+	function readRoadsData() {
+		let map;
+		try {
+			map = api.utils.getMap();
+		} catch (e) {}
+		if (!map || !map.getSource) return null;
+		let src;
+		try {
+			src = map.getSource("roads-source");
+		} catch (e) {}
+		if (!src) return null;
+		let data = src._data;
+		if (data == null && typeof src.serialize === "function") {
+			try {
+				data = src.serialize().data;
+			} catch (e) {}
+		}
+		if (!data || typeof data !== "object" || !Array.isArray(data.features)) return null;
+		return data.features;
+	}
+
+	function buildRoadGraph(force) {
+		const feats = readRoadsData();
+		if (!feats || !feats.length) {
+			roadGraphErr = "no road data (zoom into a city over streets)";
+			return null;
+		}
+		const key = feats.length;
+		if (!force && roadGraph && roadGraph.key === key) return roadGraph;
+		const nodes = [];
+		const adj = [];
+		const nodeIndex = new Map();
+		const classes = {};
+		let skipped = 0;
+		const nodeId = function (lng, lat) {
+			const k = Math.round(lng * NODE_SNAP) + ":" + Math.round(lat * NODE_SNAP);
+			let id = nodeIndex.get(k);
+			if (id === undefined) {
+				id = nodes.length;
+				nodes.push({ lng: lng, lat: lat });
+				adj.push([]);
+				nodeIndex.set(k, id);
+			}
+			return id;
+		};
+		for (const f of feats) {
+			const g = f && f.geometry;
+			if (!g || g.type !== "LineString" || !Array.isArray(g.coordinates) || g.coordinates.length < 2) continue;
+			const cls = (f.properties && f.properties.roadClass) || "?";
+			classes[cls] = (classes[cls] || 0) + 1;
+			if (NON_WALK_ROAD[cls]) {
+				skipped++;
+				continue;
+			}
+			const cs = g.coordinates;
+			let prev = nodeId(cs[0][0], cs[0][1]);
+			for (let i = 1; i < cs.length; i++) {
+				const cur = nodeId(cs[i][0], cs[i][1]);
+				if (cur !== prev) {
+					const w = roadMeters(nodes[prev].lng, nodes[prev].lat, nodes[cur].lng, nodes[cur].lat);
+					adj[prev].push({ to: cur, w: w });
+					adj[cur].push({ to: prev, w: w });
+				}
+				prev = cur;
+			}
+		}
+		const grid = new Map();
+		for (let id = 0; id < nodes.length; id++) {
+			const gk = Math.floor(nodes[id].lng / GRID_CELL) + ":" + Math.floor(nodes[id].lat / GRID_CELL);
+			let arr = grid.get(gk);
+			if (!arr) {
+				arr = [];
+				grid.set(gk, arr);
+			}
+			arr.push(id);
+		}
+		roadGraph = { key: key, nodes: nodes, adj: adj, grid: grid, classes: classes, skipped: skipped };
+		roadGraphErr = null;
+		return roadGraph;
+	}
+
+	function nearestRoadNode(lng, lat, maxMeters) {
+		const G = roadGraph;
+		if (!G) return -1;
+		const cl = Math.floor(lng / GRID_CELL);
+		const cr = Math.floor(lat / GRID_CELL);
+		let best = -1;
+		let bestD = Infinity;
+		for (let ring = 0; ring <= 5 && best === -1; ring++) {
+			for (let dx = -ring; dx <= ring; dx++) {
+				for (let dy = -ring; dy <= ring; dy++) {
+					if (ring > 0 && Math.abs(dx) !== ring && Math.abs(dy) !== ring) continue;
+					const arr = G.grid.get(cl + dx + ":" + (cr + dy));
+					if (!arr) continue;
+					for (let j = 0; j < arr.length; j++) {
+						const id = arr[j];
+						const d = roadMeters(lng, lat, G.nodes[id].lng, G.nodes[id].lat);
+						if (d < bestD) {
+							bestD = d;
+							best = id;
+						}
+					}
+				}
+			}
+		}
+		if (maxMeters != null && bestD > maxMeters) return -1;
+		return best;
+	}
+
+	function walkDistances(lng, lat, maxMeters) {
+		const G = roadGraph;
+		if (!G) return null;
+		const seed = nearestRoadNode(lng, lat, maxMeters);
+		if (seed < 0) return null;
+		const seedAccess = roadMeters(lng, lat, G.nodes[seed].lng, G.nodes[seed].lat);
+		if (seedAccess > maxMeters) return null;
+		const n = G.nodes.length;
+		const dist = new Float64Array(n);
+		for (let i = 0; i < n; i++) dist[i] = Infinity;
+		dist[seed] = seedAccess;
+		const reached = [];
+		const heap = [[seedAccess, seed]];
+		const hPush = function (item) {
+			heap.push(item);
+			let i = heap.length - 1;
+			while (i > 0) {
+				const p = (i - 1) >> 1;
+				if (heap[p][0] <= heap[i][0]) break;
+				const t = heap[p];
+				heap[p] = heap[i];
+				heap[i] = t;
+				i = p;
+			}
+		};
+		const hPop = function () {
+			const top = heap[0];
+			const last = heap.pop();
+			if (heap.length) {
+				heap[0] = last;
+				let i = 0;
+				for (;;) {
+					const l = 2 * i + 1;
+					const r = 2 * i + 2;
+					let s = i;
+					if (l < heap.length && heap[l][0] < heap[s][0]) s = l;
+					if (r < heap.length && heap[r][0] < heap[s][0]) s = r;
+					if (s === i) break;
+					const t = heap[s];
+					heap[s] = heap[i];
+					heap[i] = t;
+					i = s;
+				}
+			}
+			return top;
+		};
+		while (heap.length) {
+			const cur = hPop();
+			const d = cur[0];
+			const u = cur[1];
+			if (d > dist[u]) continue;
+			if (d > maxMeters) continue;
+			reached.push(u);
+			const edges = G.adj[u];
+			for (let k = 0; k < edges.length; k++) {
+				const e = edges[k];
+				const nd = d + e.w;
+				if (nd < dist[e.to]) {
+					dist[e.to] = nd;
+					if (nd <= maxMeters) hPush([nd, e.to]);
+				}
+			}
+		}
+		return { dist: dist, seed: seed, reached: reached };
+	}
+
+	let roadRetryPending = false;
+	let roadRetries = 0;
+	function scheduleRoadRetry() {
+		if (roadRetryPending || roadRetries > 8) return;
+		roadRetryPending = true;
+		setTimeout(function () {
+			roadRetryPending = false;
+			roadRetries++;
+			compute();
+		}, 1200);
+	}
+
+	// Build the catchment overlay as per-station road-network walk-sheds (isochrones). Each
+	// reachable street segment is a LineString coloured by its walk-time band (0=5,1=10,2=15 min);
+	// edges shared by several stations keep the nearest band. bp=1 = a planned (blueprint) station.
+	function buildWalkshedFC(stations, blueprints) {
+		const empty = { type: "FeatureCollection", features: [] };
+		const G = buildRoadGraph(false);
+		if (!G) {
+			scheduleRoadRetry();
+			return empty;
+		}
+		roadRetries = 0;
+		const edgeBand = new Map();
+		// Reach = each station's real game catchment, street-routed (so it stops at water/highways
+		// instead of crossing them). Three distance thirds give the inner-to-edge gradient.
+		const addStation = function (stn, bp) {
+			const coords = stn && stn.coords;
+			if (!coords) return;
+			const cr = catchmentRadiusMeters(stn);
+			if (!(cr > 0)) return;
+			const bandsM = [cr / 3, (2 * cr) / 3, cr];
+			const r = walkDistances(coords[0], coords[1], cr);
+			if (!r) return;
+			const dist = r.dist;
+			const reached = r.reached;
+			for (let ri = 0; ri < reached.length; ri++) {
+				const u = reached[ri];
+				const du = dist[u];
+				const edges = G.adj[u];
+				for (let k = 0; k < edges.length; k++) {
+					const v = edges[k].to;
+					const dv = dist[v];
+					if (dv === Infinity) continue;
+					const far = du > dv ? du : dv;
+					let band = 0;
+					while (band < bandsM.length - 1 && far > bandsM[band]) band++;
+					const lo = u < v ? u : v;
+					const hi = u < v ? v : u;
+					const key = lo + "_" + hi;
+					const prev = edgeBand.get(key);
+					const band2 = prev && prev.band < band ? prev.band : band;
+					const bp2 = (prev && prev.bp === 0) || bp === 0 ? 0 : 1;
+					edgeBand.set(key, { band: band2, bp: bp2 });
+				}
+			}
+		};
+		for (let i = 0; i < stations.length; i++) addStation(stations[i], 0);
+		for (let i = 0; i < blueprints.length; i++) addStation(blueprints[i], 1);
+		const features = [];
+		for (const [key, info] of edgeBand) {
+			const sep = key.indexOf("_");
+			const a = G.nodes[+key.slice(0, sep)];
+			const b = G.nodes[+key.slice(sep + 1)];
+			features.push({
+				type: "Feature",
+				properties: { band: info.band, bp: info.bp },
+				geometry: { type: "LineString", coordinates: [[a.lng, a.lat], [b.lng, b.lat]] },
+			});
+		}
+		return { type: "FeatureCollection", features: features };
+	}
+
+	// Per-station walk-shed counts: residents/jobs reachable within each band (5/10/15 min,
+	// CUMULATIVE so 10 includes 5), plus NET-NEW (points this station covers that no OTHER built
+	// station does). Blueprints get net-new vs the built network. Uses the same demand.points the
+	// coverage numbers use, so the two can never drift. Writes s.walkStations / s.walkBlueprints.
+	function computeWalkCounts(stations, blueprints, demand, s) {
+		s.walkStations = [];
+		s.walkBlueprints = [];
+		if (!demand || !demand.points || !demand.points.size) return;
+		const G = buildRoadGraph(false); // straight-line counts don't need it; the walkable-gap count does
+		// The game assigns demand by STRAIGHT-LINE distance at WALK_SPEED, so straight-line counts are
+		// game-faithful (they predict ridership). Bands = 5/10/15 min; the outer reach per station is its
+		// full game catchment. walkRes/walkJobs = the street-reachable subset (the realism gap).
+		const slBandsM = ISO_BAND_MIN.map(function (m) {
+			return m * 60 * (WALK_SPEED || 1);
+		});
+		const immediateM = slBandsM[0];
+		const pts = [];
+		for (const p of demand.points.values()) {
+			const loc = p.location;
+			if (!loc) continue;
+			const res = p.residents || 0;
+			const jobs = p.jobs || 0;
+			if (res === 0 && jobs === 0) continue;
+			const node = G ? nearestRoadNode(loc[0], loc[1], 500) : -1;
+			const access = node >= 0 ? roadMeters(loc[0], loc[1], G.nodes[node].lng, G.nodes[node].lat) : 0;
+			pts.push({ res: res, jobs: jobs, lng: loc[0], lat: loc[1], node: node, access: access });
+		}
+		const np = pts.length;
+		const coverCount = new Int32Array(np);
+		const firstCoverer = new Int32Array(np).fill(-1);
+		const classify = function (stn) {
+			const out = {
+				bands: [
+					{ res: 0, jobs: 0 },
+					{ res: 0, jobs: 0 },
+					{ res: 0, jobs: 0 },
+				],
+				catchRes: 0,
+				catchJobs: 0,
+				walkRes: 0,
+				walkJobs: 0,
+				reached: [],
+			};
+			const coords = stn && stn.coords;
+			if (!coords) return out;
+			const cr = catchmentRadiusMeters(stn);
+			if (!(cr > 0)) return out;
+			const r = G ? walkDistances(coords[0], coords[1], cr) : null;
+			const dist = r ? r.dist : null;
+			for (let i = 0; i < np; i++) {
+				const pt = pts[i];
+				const sl = roadMeters(coords[0], coords[1], pt.lng, pt.lat);
+				if (sl > cr) continue; // outside the game catchment (straight-line)
+				out.catchRes += pt.res;
+				out.catchJobs += pt.jobs;
+				out.reached.push(i);
+				if (sl <= slBandsM[slBandsM.length - 1]) {
+					let kmin = 0;
+					while (kmin < slBandsM.length - 1 && sl > slBandsM[kmin]) kmin++;
+					for (let k = kmin; k < slBandsM.length; k++) {
+						out.bands[k].res += pt.res;
+						out.bands[k].jobs += pt.jobs;
+					}
+				}
+				let wd;
+				if (sl <= immediateM) wd = sl; // doorstep: walk straight from the platform
+				else if (dist && pt.node >= 0) wd = dist[pt.node] + pt.access; // beyond: route on the street network
+				else wd = Infinity;
+				if (wd <= cr) {
+					out.walkRes += pt.res;
+					out.walkJobs += pt.jobs;
+				}
+			}
+			if (!G) {
+				out.walkRes = out.catchRes; // no road graph -> no gap to show
+				out.walkJobs = out.catchJobs;
+			}
+			return out;
+		};
+		const built = [];
+		for (let si = 0; si < stations.length; si++) {
+			const c = classify(stations[si]);
+			built.push(c);
+			for (let ri = 0; ri < c.reached.length; ri++) {
+				const i = c.reached[ri];
+				if (coverCount[i] === 0) firstCoverer[i] = si;
+				coverCount[i]++;
+			}
+		}
+		const netNew = stations.map(function () {
+			return { res: 0, jobs: 0 };
+		});
+		for (let i = 0; i < np; i++) {
+			if (coverCount[i] === 1) {
+				netNew[firstCoverer[i]].res += pts[i].res;
+				netNew[firstCoverer[i]].jobs += pts[i].jobs;
+			}
+		}
+		for (let si = 0; si < stations.length; si++) {
+			const c = built[si];
+			s.walkStations.push({
+				id: stations[si].id,
+				bands: c.bands,
+				catchRes: c.catchRes,
+				catchJobs: c.catchJobs,
+				walkRes: c.walkRes,
+				walkJobs: c.walkJobs,
+				netNewRes: netNew[si].res,
+				netNewJobs: netNew[si].jobs,
+			});
+		}
+		for (let bi = 0; bi < blueprints.length; bi++) {
+			const c = classify(blueprints[bi]);
+			let nnr = 0,
+				nnj = 0;
+			for (let ri = 0; ri < c.reached.length; ri++) {
+				const i = c.reached[ri];
+				if (coverCount[i] === 0) {
+					nnr += pts[i].res;
+					nnj += pts[i].jobs;
+				}
+			}
+			s.walkBlueprints.push({ id: blueprints[bi].id, bands: c.bands, catchRes: c.catchRes, catchJobs: c.catchJobs, walkRes: c.walkRes, walkJobs: c.walkJobs, netNewRes: nnr, netNewJobs: nnj });
+		}
+	}
+
 })();

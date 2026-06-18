@@ -14,7 +14,7 @@
  *     /tile/<provider>/<z>/<x>/<y>     provider: esri | google | hybrid | osm
  *     /status                          JSON health check
  *
- * Fetched tiles are cached under ./tile-cache/<provider>/<z>/<x>/<y>; delete that folder
+ * Fetched tiles are cached under ./np-tile-cache/<provider>/<z>/<x>/<y>; delete that folder
  * to clear the cache. All four providers are key-free.
  */
 "use strict";
@@ -25,7 +25,7 @@ const fs = require("fs");
 const path = require("path");
 
 const LISTEN_PORT = 8454;
-const CACHE_ROOT = path.join(__dirname, "tile-cache");
+const CACHE_ROOT = path.join(__dirname, "np-tile-cache");
 const FETCH_HEADERS = { "User-Agent": "NetworkPlanner-tile-relay", Referer: "http://127.0.0.1/" };
 
 // Each provider turns a z/x/y request into an upstream URL. (x + y) % 4 spreads Google
@@ -44,7 +44,7 @@ function respondTile(res, body, mime, hit) {
 	res.writeHead(200, {
 		"Content-Type": mime,
 		"Content-Length": body.length,
-		"Cache-Control": "public, max-age=604800",
+		"Cache-Control": "public, max-age=2592000",
 		"Access-Control-Allow-Origin": "*",
 		"X-Relay-Cache": hit ? "hit" : "miss",
 	});

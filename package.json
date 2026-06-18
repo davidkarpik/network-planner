@@ -1,7 +1,7 @@
 {
   "name": "network-planner",
-  "version": "0.54.0",
-  "description": "A planning & analytics suite for Subway Builder: coverage, mode-shift potential, build-here-next, per-line load factor, load-by-hour, crowding contributors, and key-free satellite imagery.",
+  "version": "0.60.0",
+  "description": "A planning & analytics suite for Subway Builder: road-network walk-shed catchments, mode-shift potential, build-here-next, a daily capacity advisor with per-line load factor, and key-free satellite imagery.",
   "author": "David Karpik",
   "license": "GPL-3.0-only",
   "keywords": [
